@@ -1,5 +1,6 @@
 {-# LANGUAGE PackageImports #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Tokenizer where
 
 import Text.Parsec hiding (spaces)
@@ -7,12 +8,12 @@ import Control.Applicative hiding (many, (<|>))
 import Control.Monad
 import "mtl" Control.Monad.Trans (liftIO)
 import "mtl" Control.Monad.Identity
-import Data.Set hiding (map)
+import Data.Set hiding (map, singleton)
 import Data.Char (toLower)
 import Data.Monoid
 import Data.Text hiding (length, map, toLower)
+import System.Environment
 import System.IO.Unsafe
-
 
 type Name = Text
 data Token = IdToken Name
@@ -67,15 +68,15 @@ item tizer = do
 
 tId :: Tokenizer PToken
 tId = lexeme $ item $ do
-  first <- letter <|> char '_' <|> char '@'
-  rest <- many (letter <|> digit <|> char '_')
+  first <- letter <|> char '_' <|> char '@' <|> char '$'
+  rest <- many (letter <|> digit <|> char '_' <|> char '$')
   return $ IdToken $ pack (first : rest)
 
 tNum :: Tokenizer PToken
 tNum = lexeme $ item $ do
   first <- many1 digit
   option (IntToken $ read first) $ do
-    dot <- char '.'
+    dot <- try (char '.' <* notFollowedBy (char '.'))
     rest <- many1 digit
     return $ NumToken $ read $ first <> (dot : rest)
 
@@ -138,7 +139,7 @@ tLineComment = item $ do
 
 tBlockComment :: Tokenizer PToken
 tBlockComment = item $ do
-  string "###"
+  try $ string "###"
   body <- manyTill anyChar (try $ string "###")
   pure $ BlockComment $ pack body
 
@@ -154,13 +155,20 @@ tKeyWord = try $ lexeme $ item $ do
       return $ Keyword kw
     go [] = unexpected "Not a keyword"
 
+tRegex :: Tokenizer PToken
+tRegex = lexeme $ item $ do
+  char '/'
+  lookAhead anyChar >>= \case
+    ' ' -> return $ Symbol "/"
+    c -> Regex . pack <$> noneOf "/" `manyTill` try (char '/')
+
 validSymbols :: Set String
 validSymbols = fromList
   [ "+", "*", "-", "/", ">", "<", ">=", "<=", "==", "===", "&", "|", "&&"
-  , "||", "^", "**", "//", "+=", "-=", "*=", "/=", "->", "=>", "="]
+  , "||", "^", "**", "//", "+=", "-=", "*=", "/=", "->", "=>", "=", "?", "=->"]
 
 symChars :: String
-symChars = "+*-/|&><=@"
+symChars = "+*-/|&><=@?"
 
 tSymbol :: Tokenizer PToken
 tSymbol = do
@@ -169,7 +177,7 @@ tSymbol = do
   spaces
   case sym `member` validSymbols of
     True -> ret pos $ Symbol $ pack sym
-    False -> unexpected $ "Invalid symbol: " <> sym
+    False ->  unexpected $ "Invalid symbol: " <> sym
 
 tToken :: Tokenizer PToken
 tToken = choice
@@ -179,8 +187,10 @@ tToken = choice
   , tKeyWord
   , tId
   , tNum
+  , tRegex
   , tSymbol
   , tDent
+  , tPunc ".."
   , tCharPuncs "(){}[]:,;."
   ]
 
@@ -198,7 +208,18 @@ puts = liftIO . putStrLn
 tokenizeFile :: FilePath -> IO (Either ParseError [PToken])
 tokenizeFile path = readFile path >>= return . tokenize
 
+testString :: FilePath -> IO ()
+testString s = case tokenize s of
+  Right tokens -> mapM_ print tokens
+  Left err -> error $ show err
+
 testFile :: FilePath -> IO ()
 testFile p = tokenizeFile p >>= \case
   Right tokens -> mapM_ print tokens
   Left err -> error $ show err
+
+main :: IO ()
+main = getArgs >>= \case
+  "path":path:_ -> testFile path
+  input:_ -> testString input
+  [] -> error $ "Please enter a file path."
