@@ -6,6 +6,8 @@ module Common (
   , module Control.Monad
   , module Control.Monad.Trans
   , module Control.Monad.Identity
+  , module Control.Monad.State.Strict
+  , module Control.Monad.Writer
   , module Data.Set
   , module Data.Char
   , module Data.Monoid
@@ -18,7 +20,9 @@ module Common (
 import Control.Applicative hiding (many, (<|>))
 import Control.Monad
 import "mtl" Control.Monad.Trans (liftIO)
+import "mtl" Control.Monad.State.Strict
 import "mtl" Control.Monad.Identity
+import "mtl" Control.Monad.Writer
 import Data.Set hiding (map, singleton, empty, foldr,
                         foldl, null, filter, findIndex,
                         foldl', partition, split)
@@ -45,5 +49,8 @@ instance Pretty Double where
   render n | isInt n = pack $ show $ floor n
            | otherwise = pack $ show n
 
-instance Pretty String
+instance Pretty Char
+
 instance Pretty Text
+
+instance Pretty a => Pretty [a]

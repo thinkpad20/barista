@@ -118,3 +118,9 @@ validSymbols = fromList
 
 symChars :: String
 symChars = "+*-/|&><=@?"
+
+instance Pretty a => Pretty (Maybe a) where
+  render Nothing = "Nothing"
+  render (Just a) = "Just " <> render a
+
+instance Pretty Int
