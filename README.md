@@ -4,6 +4,10 @@ LatteScript strives to be to TypeScript as CoffeeScript is to JavaScript. LatteS
 
 As this is being prototyped in Haskell, we will initially not have access to TypeScript's implementation in JavaScript, so we will generate actual TypeScript code, which can be compiled by `tsc`. However, eventually we will be implemented in JavaScript, allowing us to skip this step and generate a TypeScript AST directly.
 
+## Name
+
+Latte is a type of Coffee. Yeah.
+
 ## Examples:
 
 Coming soon....

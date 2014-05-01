@@ -1,76 +1,26 @@
-{-# LANGUAGE PackageImports #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
 module Parser where
 
 import Text.Parsec hiding (spaces, parse)
-import Control.Applicative hiding (many, (<|>))
-import Control.Monad
-import "mtl" Control.Monad.Trans (liftIO)
-import "mtl" Control.Monad.Identity
-import Data.Set hiding (map, singleton)
-import Data.Char (toLower)
-import Data.Monoid
-import Data.String (IsString(..))
-import Data.Text hiding (length, map, toLower)
-import System.Environment
 import System.IO.Unsafe
 
-type Name = Text
-data AbsExpr expr = Variable Name
-                  | Number Double
-                  | String Text
-                  | Regex Text
-                  | InString InString
-                  | Assign Pattern expr
-                  | Block [expr]
-                  | Array [expr]
-                  | Function [Name] expr
-                  | Call expr [expr]
-                  | Binary Name expr expr
-                  | Prefix Name expr
-                  | Postfix expr Name
-                  | Return (Maybe expr)
-                  | Throw expr
-                  | Switch expr [SwitchCase expr]
-                  | If expr expr (Maybe expr)
-                  | ForIn Pattern expr expr
-                  | ForOf Pattern expr expr
-                  | While expr expr
-                  | TryCatch expr Name expr (Maybe expr)
-                  | Comment Text
-                  | Break
-                  | Continue
-                  deriving (Show, Eq)
+import Common
+import AST
 
-data InString = Plain Text
-              | Interpolated InString Expr InString
-              deriving (Show, Eq)
-
-data SwitchCase expr = SwitchCase expr deriving (Show, Eq)
-data Pattern = Pattern deriving (Show, Eq)
-data Expr = Expr SourcePos (AbsExpr Expr) deriving (Eq)
-data Parsed a = Parsed SourcePos a deriving (Show)
+data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
 type IndentState = [Int]
 type Parser = ParsecT String IndentState IO
 
-instance Show Expr where
-  show (Expr _ e) = show e
+instance Pretty Expr where
+  render (Expr _ e) = render e
 
-instance IsString InString where
-  fromString str = Plain $ pack str
-
-instance Monoid InString where
-  mempty = Plain mempty
-  is1 `mappend` is2 = case (is1, is2) of
-    (Plain s, Plain s') -> Plain (s <> s')
-    (s, Interpolated is e is') -> Interpolated (s <> is) e is'
-    (Interpolated is e is', s) -> Interpolated is e (is' <> s)
-
-keywords :: [Text]
-keywords = [ "catch", "class", "else", "extends", "false", "finally", "for"
-           , "if", "in", "is", "isnt", "new", "return", "switch", "then"
-           , "this", "true", "try", "when", "while"]
+keywords :: Set Text
+keywords = fromList
+  [ "catch", "class", "else", "extends", "false", "finally", "for"
+  , "if", "in", "is", "isnt", "new", "return", "switch", "then"
+  , "this", "true", "try", "when", "while"]
 
 spaces :: Parser ()
 spaces = (many $ oneOf " \t") *> return ()
@@ -105,8 +55,13 @@ unExpr (Expr _ abstr) = abstr
 getPos :: Expr -> SourcePos
 getPos (Expr pos _) = pos
 
+checkKeyword :: Parser Text -> Parser Text
+checkKeyword p = try p >>= \case
+  ident | ident `member` keywords -> unexpected $ "keyword " <> show ident
+        | otherwise -> return ident
+
 pIdent :: Parser Name
-pIdent = do
+pIdent = checkKeyword $ do
   first <- letter <|> char '_' <|> char '@' <|> char '$'
   rest <- many (letter <|> digit <|> char '_' <|> char '$')
   return $ pack (first : rest)
@@ -138,7 +93,9 @@ pInString = item $ InString <$> (char '"' *> go) where
           | otherwise -> escape c
         where consume = anySpaces >> (Plain str <>) <$> go
       '#' -> anyChar >>= \case
-        '{' -> Interpolated (Plain str) <$> (pExpr <* char '}') <*> go
+        '{' -> do
+          expr <- unExpr <$> pExpr <* char '}'
+          Interpolated (Plain str) <$> (pure expr) <*> go
         c -> escape c
       '"' -> return (Plain str)
       c -> error $ "wtf is " <> [c]
@@ -200,19 +157,26 @@ validSymbols = fromList
 symChars :: String
 symChars = "+*-/|&><=@?"
 
+pLogical :: Parser Expr
+pLogical = pLeftAssoc ["&&", "||", "and", "or"] pComparative
+
+pComparative :: Parser Expr
+pComparative = pLeftAssoc ["<", ">", "<=", ">=", "==", "!="] pAdditive
+
 pAdditive :: Parser Expr
-pAdditive = pLeftAssoc "+-" pMultiplicative
+pAdditive = pLeftAssoc ["+", "-"] pMultiplicative
 
 pMultiplicative :: Parser Expr
-pMultiplicative = pLeftAssoc "*/" pCallChain
+pMultiplicative = pLeftAssoc ["*", "/"] pCallChain
 
-pLeftAssoc :: String -> Parser Expr -> Parser Expr
-pLeftAssoc ops higher = higher >>= go where
-  go left = spaces *> inp *> optionMaybe (oneOf ops <* spaces) >>= \case
+pLeftAssoc :: [String] -> Parser Expr -> Parser Expr
+pLeftAssoc ops higher = logged higher >>= go where
+  str = choice . map sstring
+  go left = spaces *> inp *> optionMaybe (str ops <* spaces) >>= \case
     Nothing -> return left
     Just op -> do
       right <- pLeftAssoc ops higher
-      go $ Expr (getPos left) $ Binary (singleton op) left right
+      go $ Expr (getPos left) $ Binary op left right
 
 pExprOrBlock :: Parser Expr
 pExprOrBlock = pBlock <|> pExpr
@@ -227,7 +191,12 @@ pTerm :: Parser Expr
 pTerm = choice [pVariable, pNumber, pString, pParens]
 
 pExpr :: Parser Expr
-pExpr = pAdditive
+pExpr = pLogical
+
+pTopLevel :: Parser Expr
+pTopLevel = pExpr `sepBy1` same >>= \case
+  [expr] -> return expr
+  (e:exprs) -> return $ Expr (getPos e) $ Block exprs
 
 indent :: Parser ()
 indent = try $ do
@@ -280,74 +249,40 @@ pRegex = item $ do
     ' ' -> unexpected $ "Not a regex"
     c -> Regex . pack <$> noneOf "/" `manyTill` try (char '/')
 
-logged :: Show a => Parser a -> Parser a
+logged :: Pretty a => Parser a -> Parser a
 logged p = do
   a <- p
-  puts $ "Parsed: " <> show a
+  puts $ "Parsed: " <> render a
   inp
   return a
 
 inp :: Parser ()
 inp = do input <- getInput
-         puts $ "Remaining input: " <> show input
+         puts $ "Remaining input: " <> render input
 
---tSymbol :: Parser Expr
---tSymbol = do
---  pos <- getPosition
---  sym <- many1 $ oneOf symChars
---  spaces
---  case sym `member` validSymbols of
---    True -> ret pos $ Symbol $ pack sym
---    False ->  unexpected $ "Invalid symbol: " <> sym
-
---tToken :: Parser Expr
---tToken = choice
---  [ tBlockComment
---  , tLineComment
---  , tString
---  , tKeyWord
---  , tId
---  , tNum
---  , tRegex
---  , tSymbol
---  , tDent
---  , tPunc ".."
---  , tCharPuncs "(){}[]:,;."
---  ]
-
---showInput "" = ""
---showInput (' ':cs) = '_' : showInput cs
---showInput ('\n':cs) = '|' : showInput cs
---showInput (c:cs) = c : showInput cs
-
-puts :: String -> Parser ()
-puts = liftIO . putStrLn
-
---tokenizeFile :: FilePath -> IO (Either ParseError [Expr])
---tokenizeFile path = readFile path >>= return . tokenize
+puts :: Text -> Parser ()
+puts = liftIO . putStrLn . unpack
 
 parse :: String -> Either ParseError Expr
-parse = runParse pExpr
+parse = parseWith pTopLevel
 
-runParse :: Parser a -> String -> Either ParseError a
-runParse parser = unsafePerformIO . runParserT parser initState ""
+parseWith :: Parser a -> String -> Either ParseError a
+parseWith parser = unsafePerformIO . runParserT parser initState ""
 
-testStringWith :: Parser Expr -> FilePath -> IO ()
-testStringWith parser s = case runParse parser s of
-  Right (Expr _ (Block exprs)) -> mapM_ print exprs
-  Right expr -> print expr
-  Left err -> error $ show err
+parseFile :: FilePath -> IO (Either ParseError Expr)
+parseFile = parseFileWith pExpr
+
+parseFileWith :: Parser a -> FilePath -> IO (Either ParseError a)
+parseFileWith parser path = readFile path >>= return . parseWith parser
 
 testString :: FilePath -> IO ()
 testString = testStringWith pExpr
 
---testFile :: FilePath -> IO ()
---testFile p = tokenizeFile p >>= \case
---  Right tokens -> mapM_ print tokens
---  Left err -> error $ show err
+testStringWith :: Parser Expr -> FilePath -> IO ()
+testStringWith parser s = case parseWith parser s of
+  Right (Expr _ (Block exprs)) -> mapM_ print' exprs
+  Right expr -> print' expr
+  Left err -> error $ show err
 
---main :: IO ()
---main = getArgs >>= \case
---  "path":path:_ -> testFile path
---  input:_ -> testString input
---  [] -> error $ "Please enter a file path."
+print' :: Pretty a => a -> IO ()
+print' = putStrLn . unpack . render
