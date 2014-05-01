@@ -61,10 +61,7 @@ lexeme :: Tokenizer a -> Tokenizer a
 lexeme tizer = tizer <* spaces
 
 item :: Tokenizer a -> Tokenizer (Parsed a)
-item tizer = do
-  p <- getPosition
-  a <- tizer
-  return $ Parsed p a
+item tokenizer = Parsed <$> getPosition <*> tokenizer
 
 tId :: Tokenizer PToken
 tId = lexeme $ item $ do
