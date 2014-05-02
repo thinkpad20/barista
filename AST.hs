@@ -52,7 +52,6 @@ data ClassDec expr = ClassDecExpr expr
                    deriving (Show, Eq)
 
 data SwitchCase expr = SwitchCase expr deriving (Show, Eq)
-data Pattern = Pattern deriving (Show, Eq)
 
 instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
   render = \case
@@ -201,8 +200,6 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
         return $ "class" <> name' <> extends' <> decs'
       e -> error $ "can't render " <> show e
       where go' = go . unExpr
-
-instance Pretty Pattern
 
 instance IsString (InString e) where
   fromString str = Plain $ pack str

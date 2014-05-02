@@ -63,7 +63,7 @@ pInlineBlock = item $ logged "inline block" $ Block <$> pStatement `sepBy1` scha
 
 -- Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
-pTerm = choice [pVariable, pNumber, pString, pParens]
+pTerm = choice [pVariable, pNumber, pString, pParens, pArray]
 
 -- An expression wrapped in parentheses.
 pParens :: Parser Expr
@@ -181,7 +181,7 @@ pFunction = item $ do
     Nothing -> return []
     Just as -> return as
   sstring "->"
-  Function args <$> pExprOrBlock
+  Function args <$> (pExprOrBlock <|> item (return EmptyExpr))
   where pArgs = schar '(' *> pIdent `sepBy` schar ',' <* char ')'
 
 -- | Parses a variable declaration/assignment.
@@ -198,6 +198,11 @@ pPattern = choice $ [getVar, pArrayOfVariables, pObjectDeref]
           Expr _ (Call _ _) -> unexpected $ "Pattern ended with function call"
           e -> return e
         pObjectDeref = unexpected "not implemented"
+
+pArray :: Parser Expr
+pArray = item $ do
+  exprs <- between (schar '[') (schar ']') $ pExpr `sepBy` schar ','
+  return $ Array exprs
 
 ---------------------------------------------------
 -----------------  Control flow  ------------------
@@ -218,7 +223,7 @@ pWhile = item $ While <$ pKeyword "while"
                       <*> logged "while condition" pExpr
                       <*> logged "while body" pThen
 
--- | For loops can be either `in` or `of`.
+-- | For loops, two kinds: either `in` or `of`.
 pFor :: Parser Expr
 pFor = item $ do
   pKeyword "for"
@@ -235,7 +240,7 @@ pThen = pBlock <|> pKeyword "then" *> pInlineBlock
 ------------  Calling functions and attributes  ------------
 ------------------------------------------------------------
 
--- Function application has low precedence in CoffeeScript,
+-- | Function application has low precedence in CoffeeScript,
 -- unless the arguments are not separated by spaces (see below).
 -- So we parse a "call chain" (which is space-sensitive) first.
 pCall :: Parser Expr
@@ -265,7 +270,12 @@ pCallChain = lexeme $ logged "term" pTerm >>= go where
         -- Grab the arguments, then recurse.
         args <- schar '(' *> pExpr `sepBy` schar ',' <* char ')'
         go $ Expr (getPos expr) $ Call expr args
-      -- If there's not, we can skip spaces.
+      -- If there is a square bracket, it's an object dereference.
+      '[' -> do
+        -- Grab the arguments, then recurse.
+        ref <- schar '[' *> pExpr <* char ']'
+        go $ Expr (getPos expr) $ ObjectDeref expr ref
+      -- Otherwise, we can skip spaces.
       c -> spaces *> lookAhead anyChar >>= \case
         -- If the next thing is a dot, then grab an identifier and recurse.
         '.' -> do
@@ -355,9 +365,17 @@ nodent = try $ do
     True -> return ()
     False -> unexpected "Not an nodent"
 
+-- | Succeeds if there's an empty line (or only whitespace)
+emptyLine :: Parser ()
+emptyLine = try $ do
+  newline
+  spaces
+  lookAhead (char '\n')
+  return ()
+
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
-same = nodent <|> (schar ';' *> return ())
+same = nodent <|> (schar ';' *> return ()) <|> emptyLine
 
 -- | Parses its argument one or more times, separated by @same@.
 blockOf :: Parser a -> Parser [a]
@@ -505,7 +523,7 @@ parseWith parser = runIdentity . runWriterT . runParserT parser initState ""
 
 -- | Parses a file.
 parseFile :: FilePath -> IO (Either ParseError Expr, Text)
-parseFile = parseFileWith pExpr
+parseFile = parseFileWith pTopLevel
 
 -- | Parses a file with a specific parser.
 parseFileWith :: Parser a -> FilePath -> IO (Either ParseError a, Text)
