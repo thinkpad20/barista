@@ -6,18 +6,22 @@ module Parser where
 
 import Prelude hiding (replicate)
 import Text.Parsec hiding (spaces, parse)
-import System.IO.Unsafe
+--import System.IO.Unsafe
+import System.Environment
 
 import Common hiding (tail)
 import AST
 
 data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
 data ParserState = ParserState {indents::[Int], debugIndent::Int}
-type Parser = ParsecT String ParserState (WriterT Text IO)
+type Parser = ParsecT String ParserState (WriterT Text Identity)
 
 instance Pretty Expr where
   render (Expr _ e) = render e
   pretty (Expr _ e) = pretty e
+
+instance IsExpr Expr where
+  unExpr (Expr _ abstr) = abstr
 
 ------------------------------------------------------------
 -------------------  High-level parsers  -------------------
@@ -25,7 +29,7 @@ instance Pretty Expr where
 
 -- Entry point parser.
 pTopLevel :: Parser Expr
-pTopLevel = go where
+pTopLevel = go <* eof where
   go = blockOf pStatement >>= \case
     [expr] -> return expr
     exprs@(e:_) -> return $ Expr (getPos e) $ Block exprs
@@ -36,7 +40,7 @@ pBlock = item $ logged "block" $ Block <$> indented pStatement
 
 -- A statement. For now redundant, possibly needed later.
 pStatement :: Parser Expr
-pStatement = logged "statement" pExpr
+pStatement = logged "statement" pExpr <|> item (return EmptyExpr)
 
 -- An expression. If statements, unary/binary operations, etc.
 pExpr :: Parser Expr
@@ -186,8 +190,13 @@ pAssign = item $ try $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
 
 -- | Patterns are a restricted subset of expressions.
 pPattern :: Parser Expr
-pPattern = choice $ [pCallChain, pArrayOfVariables, pObjectDeref]
-  where pArrayOfVariables = unexpected "not implemented"
+pPattern = choice $ [getVar, pArrayOfVariables, pObjectDeref]
+  where pArrayOfVariables = item $ do
+          vars <- between (schar '[') (schar ']') $ getVar `sepBy` schar ','
+          return $ Array vars
+        getVar = pCallChain >>= \case
+          Expr _ (Call _ _) -> unexpected $ "Pattern ended with function call"
+          e -> return e
         pObjectDeref = unexpected "not implemented"
 
 ---------------------------------------------------
@@ -346,13 +355,13 @@ nodent = try $ do
     True -> return ()
     False -> unexpected "Not an nodent"
 
--- | In CoffeeScript, a semicolon is the same as same indentation.
+-- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
 same = nodent <|> (schar ';' *> return ())
 
 -- | Parses its argument one or more times, separated by @same@.
 blockOf :: Parser a -> Parser [a]
-blockOf p = p `sepBy1` same
+blockOf p = p `sepEndBy1` same
 
 -- | Parses an indented block of @p@s.
 indented :: Parser a -> Parser [a]
@@ -426,10 +435,6 @@ keywords = fromList
   , "if", "in", "is", "isnt", "new", "return", "switch", "then"
   , "this", "true", "try", "when", "while"]
 
-instance IsExpr Expr where
-  -- | Pulls the abstract expression out of an Expr. Occasionally necessary.
-  unExpr (Expr _ abstr) = abstr
-
 -- | Gets the position out of an expr.
 getPos :: Expr -> SourcePos
 getPos (Expr pos _) = pos
@@ -496,7 +501,7 @@ parse' = fst . parse
 
 -- | Parses a string with a specific parser.
 parseWith :: Parser a -> String -> (Either ParseError a, Text)
-parseWith parser = unsafePerformIO . runWriterT . runParserT parser initState ""
+parseWith parser = runIdentity . runWriterT . runParserT parser initState ""
 
 -- | Parses a file.
 parseFile :: FilePath -> IO (Either ParseError Expr, Text)
@@ -506,8 +511,14 @@ parseFile = parseFileWith pExpr
 parseFileWith :: Parser a -> FilePath -> IO (Either ParseError a, Text)
 parseFileWith parser path = readFile path >>= return . parseWith parser
 
+-- | Parses a file and prints the result.
+testFile :: FilePath -> IO ()
+testFile = parseFile >=> \case
+  (Right expr, _) -> print' expr
+  (Left err, _) -> error $ show err
+
 -- | Parses a string and prints the result.
-testString :: FilePath -> IO ()
+testString :: String -> IO ()
 testString = testStringWith pTopLevel
 
 -- | Tests with a specific parser.
@@ -530,3 +541,9 @@ testStringWithVerbose parser s = do
   case res of
     Right expr -> print' expr
     Left err -> error $ show err
+
+main :: IO ()
+main = getArgs >>= \case
+  "-p":path:_ -> testFile path
+  input:_ -> testString input
+

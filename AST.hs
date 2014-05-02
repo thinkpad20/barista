@@ -35,10 +35,12 @@ data AbsExpr expr = Variable Name
                   | Comment Text
                   | Break
                   | Continue
+                  | EmptyExpr
                   | Class (Maybe Name) (Maybe expr) [ClassDec expr]
                   deriving (Show, Eq)
 
 class IsExpr a where
+  -- | Pulls the abstract expression out of a wrapped AbsExpr.
   unExpr :: a -> AbsExpr a
 
 data InString e = Plain Text
@@ -87,6 +89,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     Comment c -> "# " <> c
     Break -> "break"
     Continue -> "continue"
+    EmptyExpr -> "~(empty expression)~"
     Dotted expr n -> render expr <> "." <> n
     Class name extends decs -> "class" <>
       case name of {Nothing -> ""; Just n -> " " <> n} <>
@@ -109,6 +112,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Number n -> return $ render n
       String s -> return $ render s
       Regex r -> return $ render r
+      EmptyExpr -> return "~(empty expression)~"
       InString s -> error "interp string pretty printing"
       Assign pat expr -> do
         expr' <- go' expr
