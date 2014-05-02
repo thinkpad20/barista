@@ -53,9 +53,9 @@ pExpr = choice [logged "if" pIf,
 
 -- For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
-pExprOrBlock = pBlock <|> do
-  e <- pExpr
-  return $ Expr (getPos e) $ Block [e]
+pExprOrBlock = pBlock <|> pInlineBlock -- <|> do
+  --e <- pExpr
+  --return $ Expr (getPos e) $ Block [e]
 
 -- An inline-only block
 pInlineBlock :: Parser Expr
@@ -79,7 +79,12 @@ pParens = enclose "()" pExpr
 
 -- | Parses any valid, non-keyword identifier. Doesn't store position.
 pIdent :: Parser Name
-pIdent = checkKeyword $ do
+pIdent = checkKeyword pAnyIdent
+
+-- | Same as @pIdent@, but doesn't check if it's a keyword. Used for .member
+-- vars.
+pAnyIdent :: Parser Name
+pAnyIdent = do
   first <- letter <|> char '_' <|> char '@' <|> char '$'
   rest <- many (letter <|> digit <|> char '_' <|> char '$')
   return $ pack (first : rest)
@@ -87,6 +92,10 @@ pIdent = checkKeyword $ do
 -- | Same as @pIdent@ but skips spaces after.
 pIdent' :: Parser Name
 pIdent' = pIdent <* spaces
+
+-- | Same as @pAnyIdent@ but skips spaces.
+pAnyIdent' :: Parser Name
+pAnyIdent' = pAnyIdent <* spaces
 
 -- | Wraps an ident parse in a Variable and records the position.
 pVariable :: Parser Expr
@@ -216,9 +225,9 @@ pObject = go where
   keyValOrJustKey = try keyVal <|> do
     ident <- pIdent'
     (,) ident <$> item (pure $ Variable ident)
-  keyVal = (,) <$> pIdent' <* schar ':' <*> pExpr
+  keyVal = (,) <$> pAnyIdent' <* schar ':' <*> pExpr
   inline = keyVal `sepBy1` schar ','
-  withIndent = indented keyValOrJustKey
+  withIndent = indented keyVal
   withBraces = enclose "{}" keyValOrJustKey `sepBy` dividers
   dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
 
@@ -232,8 +241,6 @@ pIf = item $ If <$ pKeyword "if"
                 <*> logged "if condition" pExpr
                 <*> logged "then branch" pThen
                 <*> logged "else branch" pElse
-  where
-    pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
 
 -- | While loops.
 pWhile :: Parser Expr
@@ -253,6 +260,9 @@ pFor = item $ do
 -- | Used by a few structures to do inlines (if a then b; c; d)
 pThen :: Parser Expr
 pThen = pBlock <|> pKeyword "then" *> pInlineBlock
+
+pElse :: Parser (Maybe Expr)
+pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
 
 ------------------------------------------------------------
 ------------  Calling functions and attributes  ------------
@@ -276,7 +286,8 @@ pCall = lexeme $ do
 -- | This parser will grab a chain of function applications and dots.
 -- For example, `foo.bar().baz(a, b).qux`. In CoffeeScript, there is
 -- a syntactic distinction between `a (b) 1` and `a(b) 1`. The former
--- means `a(b(1))` and the latter `a(b)(1)`. Screwy but whatevs.
+-- means `a(b(1))` and the latter `a(b)(1)`. Similarly, `a[b]` means
+-- `a[b]`, while `a [b]` means `a([b])`. Screwy but whatevs.
 pCallChain :: Parser Expr
 pCallChain = lexeme $ logged "term" pTerm >>= go where
   go :: Expr -> Parser Expr
@@ -297,7 +308,7 @@ pCallChain = lexeme $ logged "term" pTerm >>= go where
       c -> spaces *> lookAhead anyChar >>= \case
         -- If the next thing is a dot, then grab an identifier and recurse.
         '.' -> do
-          member <- char '.' *> pIdent
+          member <- char '.' *> pAnyIdent
           go $ Expr (getPos expr) $ Dotted expr member
         -- Otherwise, we're done.
         c -> return expr
@@ -453,15 +464,18 @@ item :: Parser (AbsExpr Expr) -> Parser Expr
 item parser = Expr <$> getPosition <*> parser
 
 -- | Parses a given keyword. If it fails, it consumes no input.
-pKeyword :: String -> Parser String
-pKeyword s = lexeme $ try $ do
-  kw <- string s
-  notFollowedBy $ choice [letter, digit, char '_', char '$']
-  return kw
+pKeyword :: String -> Parser Text
+pKeyword s = exactly s (choice [letter, digit, char '_', char '$'])
 
 -- | Parses the exact symbol given, or consumes nothing.
 pExactSym :: String -> Parser Text
-pExactSym s = try $ sstring s <* notFollowedBy (oneOf symChars)
+pExactSym s = exactly s (oneOf symChars)
+
+exactly :: Show a => String -> Parser a -> Parser Text
+exactly s others = lexeme $ try $ do
+  res <- string s
+  notFollowedBy others
+  return $ pack res
 
 -- | Fails if the parsed identifier is a keyword.
 checkKeyword :: Parser Text -> Parser Text
@@ -564,11 +578,9 @@ testString = testStringWith pTopLevel
 
 -- | Tests with a specific parser.
 testStringWith :: Parser Expr -> FilePath -> IO ()
-testStringWith parser s = do
-  let (res, _) = parseWith parser s
-  case res of
-    Right expr -> print' expr
-    Left err -> error $ show err
+testStringWith parser s = case parseWith parser s of
+  (Right expr, _) -> print' expr
+  (Left err, _) -> error $ show err
 
 -- | Parses a string and prints the result.
 testStringVerbose :: FilePath -> IO ()

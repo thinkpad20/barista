@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 module AST where
 
 import Prelude hiding (replicate)
@@ -52,7 +53,9 @@ data ClassDec expr = ClassDecExpr expr
                    | ClassDecDef Name expr
                    deriving (Show, Eq)
 
-data SwitchCase expr = SwitchCase expr deriving (Show, Eq)
+data SwitchCase expr = When [expr] expr
+                     | Else expr
+                     deriving (Show, Eq)
 
 instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
   render = \case
@@ -67,11 +70,13 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     ArrayRange e1 e2 -> "[" <> render e1 <> " .. " <> render e2 <> "]"
     ObjectDeref e ref -> render e <> "[" <> render ref <> "]"
     Object pairs -> "{" <> intercalate ", " (map renderP pairs) <> "}"
-    Function names expr -> "(" <> intercalate ", " names <> ") -> " <> render expr
-    --Call (Variable n) exprs -> n <> " " <> intercalate ", " (map render exprs)
-    Call expr exprs -> case exprs of
-      [] -> "(" <> render expr <> ") " <> "()"
-      exprs -> "(" <> render expr <> ") " <> intercalate ", " (map render exprs)
+    Function names expr -> "(" <> intercalate ", " names <> ") -> "
+                               <> render expr
+    Call expr exprs -> do
+      let func = render' expr
+      case exprs of
+        [] -> func <> "()"
+        exprs -> func <> " " <> intercalate ", " (map render exprs)
     Binary op e1 e2 -> "(" <> render e1 <> ") " <> op <> " (" <> render e2 <> ")"
     Prefix op expr -> op <> render expr
     Postfix expr op -> render expr <> op
@@ -97,18 +102,19 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       case extends of {Nothing -> ""; Just e -> " extends " <> render e} <>
       case decs of {[] -> ""; ds -> "{" <> intercalate "; " (map render ds) <> "}"}
     e -> error $ "can't render " <> show e
-    where renderP (name, expr) = name <> ":" <> render (unExpr expr)
-    --where
-    --  render' :: Pretty e => AbsExpr e -> Text
-    --  render' e = case e of
-    --    Binary _ _ _ -> "(" <> render e <> ")"
-    --    Call _ _ -> "(" <> render e <> ")"
-    --    Prefix _ _ -> "(" <> render e <> ")"
-    --    Postfix _ _ -> "(" <> render e <> ")"
-    --    Function _ _ -> "(" <> render e <> ")"
-    --    _ -> render e
-  pretty e = evalState (go e) (-1) where
-    --go :: AbsExpr e -> State Int Text
+    where
+     renderP (name, expr) = name <> ":" <> render (unExpr expr)
+     render' :: (Pretty e, IsExpr e) => e -> Text
+     render' e = case unExpr e of
+       Binary _ _ _ -> "(" <> render e <> ")"
+       Call _ _ -> "(" <> render e <> ")"
+       Prefix _ _ -> "(" <> render e <> ")"
+       Postfix _ _ -> "(" <> render e <> ")"
+       Function _ _ -> "(" <> render e <> ")"
+       _ -> render e
+
+  pretty e = evalState (go e) 0 where
+    go :: (IsExpr e, Pretty e) => AbsExpr e -> State Int Text
     go = \case
       Variable n -> return n
       Number n -> return $ render n
@@ -119,10 +125,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Assign pat expr -> do
         expr' <- go' expr
         return $ render pat <> " = " <> expr'
-      Block exprs -> indented exprs $ \e -> do
-        level <- get
-        e' <- go' e
-        return $ replicate level "  " <> e' <> "\n"
+      Block exprs -> indented exprs go'
       Array exprs -> do
         res <- mapM go' exprs
         return $ "[" <> intercalate ", " res <> "]"
@@ -135,29 +138,36 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
         ref' <- go' ref
         return $ e' <> "[" <> ref' <> "]"
       Object pairs -> indented pairs $ \(name, expr) -> do
-        level <- get
         expr' <- go' expr
-        return $ replicate level "  " <> name <> ": " <> expr' <> "\n"
+        return $ name <> ": " <> expr'
       Function names expr -> do
         let start = "(" <> intercalate ", " names <> ") -> "
         mappend start <$> go' expr
-      --Call (Variable n) exprs -> n <> " " <> intercalate ", " (map render exprs)
-      Call expr exprs -> go' expr >>= \e -> case exprs of
-        [] -> return $ "(" <> e <> ") " <> "()"
+      Call expr exprs -> go'' expr >>= \e -> case exprs of
+        [] -> return $ e <> "()"
         exprs -> do
-          exprs' <- mapM go' exprs
-          return $ "(" <> e <> ") " <> intercalate ", " exprs'
+          exprs' <- mapM go'' exprs
+          return $ e <> " " <> intercalate ", " exprs'
       Binary op e1 e2 -> do
-        e1' <- go' e1
-        e2' <- go' e2
-        return $ "(" <> e1' <> ") " <> op <> " (" <> e2' <> ")"
+        e1' <- go'' e1
+        e2' <- go'' e2
+        return $ e1' <> " " <> op <> " " <> e2'
       Prefix op expr -> go' expr >>= \e -> return $ op <> e
       Postfix expr op -> go' expr >>= \e -> return $ e <> op
       Return Nothing -> return "return"
       Return (Just expr) -> ("return " <>) <$> go' expr
       Throw expr -> ("throw " <>) <$> go' expr
       New expr -> ("new " <>) <$> go' expr
-      Switch expr cases -> error "switch pretty printing"
+      Switch expr cases -> do
+        expr' <- go' expr
+        cases' <- indented cases $ \case
+          When es res -> do
+            es' <- mapM go' es
+            res' <- go' res
+            return $ "when " <> intercalate ", " es' <> res'
+          Else res ->
+            fmap ("else " <>) $ go' res
+        return $ "switch " <> expr' <> cases'
       If c t f -> do
         c' <- go' c
         t' <- go' t
@@ -165,8 +175,8 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
           Nothing -> return $ "if " <> c' <> t'
           Just f -> do
             f' <- go' f
-            level <- get
-            return $ "if " <> c' <> t' <> replicate level " " <> "else" <> f'
+            els <- line "else"
+            return $ "if " <> c' <> t' <> els <> f'
       ForIn pat e1 e2 -> do
         e1' <- go' e1
         e2' <- go' e2
@@ -202,12 +212,26 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
             return $ "\n" <> mconcat strs
         return $ "class" <> name' <> extends' <> decs'
       e -> error $ "can't render " <> show e
-      where go' = go . unExpr
-            indented list f = do
-              modify (+1)
-              strs <- forM list f
-              modify (\i -> i - 1)
-              return $ "\n" <> mconcat strs
+    line :: Text -> State Int Text
+    line txt = do
+      level <- get
+      when (level < 0) $ error "Illegal indent level"
+      return $ replicate level "  " <> txt <> "\n"
+    indented list f = do
+      modify (+1)
+      strs <- forM list $ f >=> line
+      modify (\i -> i - 1)
+      return $ "\n" <> mconcat strs
+    wrap e = go' e >>= \e' -> return $ "(" <> e' <> ")"
+    go' :: (IsExpr e, Pretty e) => e -> State Int Text
+    go' = go . unExpr
+    go'' e = case unExpr e of
+      Binary _ _ _ -> wrap e
+      Call _ _ -> wrap e
+      Prefix _ _ -> wrap e
+      Postfix _ _ -> wrap e
+      Function _ _ -> wrap e
+      _ -> go' e
 
 instance IsString (InString e) where
   fromString str = Plain $ pack str
