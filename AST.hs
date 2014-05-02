@@ -32,6 +32,7 @@ data AbsExpr expr = Variable Name
                   | ForOf [Name] expr expr
                   | While expr expr
                   | TryCatch expr Name expr (Maybe expr)
+                  | Do [Name] expr
                   | Comment Text
                   | Break
                   | Continue
@@ -65,6 +66,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     Array exprs -> "[" <> intercalate ", " (map render exprs) <> "]"
     ArrayRange e1 e2 -> "[" <> render e1 <> " .. " <> render e2 <> "]"
     ObjectDeref e ref -> render e <> "[" <> render ref <> "]"
+    Object pairs -> "{" <> intercalate ", " (map renderP pairs) <> "}"
     Function names expr -> "(" <> intercalate ", " names <> ") -> " <> render expr
     --Call (Variable n) exprs -> n <> " " <> intercalate ", " (map render exprs)
     Call expr exprs -> case exprs of
@@ -95,6 +97,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       case extends of {Nothing -> ""; Just e -> " extends " <> render e} <>
       case decs of {[] -> ""; ds -> "{" <> intercalate "; " (map render ds) <> "}"}
     e -> error $ "can't render " <> show e
+    where renderP (name, expr) = name <> ":" <> render (unExpr expr)
     --where
     --  render' :: Pretty e => AbsExpr e -> Text
     --  render' e = case e of
@@ -116,14 +119,10 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Assign pat expr -> do
         expr' <- go' expr
         return $ render pat <> " = " <> expr'
-      Block exprs -> do
-        modify (+1)
-        strs <- forM exprs $ \e -> do
-          level <- get
-          e' <- go' e
-          return $ replicate level "  " <> e' <> "\n"
-        modify (\i -> i - 1)
-        return $ "\n" <> mconcat strs
+      Block exprs -> indented exprs $ \e -> do
+        level <- get
+        e' <- go' e
+        return $ replicate level "  " <> e' <> "\n"
       Array exprs -> do
         res <- mapM go' exprs
         return $ "[" <> intercalate ", " res <> "]"
@@ -135,6 +134,10 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
         e' <- go' e
         ref' <- go' ref
         return $ e' <> "[" <> ref' <> "]"
+      Object pairs -> indented pairs $ \(name, expr) -> do
+        level <- get
+        expr' <- go' expr
+        return $ replicate level "  " <> name <> ": " <> expr' <> "\n"
       Function names expr -> do
         let start = "(" <> intercalate ", " names <> ") -> "
         mappend start <$> go' expr
@@ -200,6 +203,11 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
         return $ "class" <> name' <> extends' <> decs'
       e -> error $ "can't render " <> show e
       where go' = go . unExpr
+            indented list f = do
+              modify (+1)
+              strs <- forM list f
+              modify (\i -> i - 1)
+              return $ "\n" <> mconcat strs
 
 instance IsString (InString e) where
   fromString str = Plain $ pack str

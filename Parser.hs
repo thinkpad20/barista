@@ -63,11 +63,15 @@ pInlineBlock = item $ logged "inline block" $ Block <$> pStatement `sepBy1` scha
 
 -- Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
-pTerm = choice [pVariable, pNumber, pString, pParens, pArray]
+pTerm = choice [pVariable,
+                pNumber,
+                pString,
+                pParens,
+                pArray]
 
 -- An expression wrapped in parentheses.
 pParens :: Parser Expr
-pParens = between (schar '(') (char ')') pExpr
+pParens = enclose "()" pExpr
 
 ------------------------------------------------------------
 -----------------------  Primitives  -----------------------
@@ -192,17 +196,31 @@ pAssign = item $ try $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
 pPattern :: Parser Expr
 pPattern = choice $ [getVar, pArrayOfVariables, pObjectDeref]
   where pArrayOfVariables = item $ do
-          vars <- between (schar '[') (schar ']') $ getVar `sepBy` schar ','
+          vars <- enclose "[]" $ getVar `sepBy` schar ','
           return $ Array vars
         getVar = pCallChain >>= \case
           Expr _ (Call _ _) -> unexpected $ "Pattern ended with function call"
           e -> return e
         pObjectDeref = unexpected "not implemented"
 
+-- | Parses an array literal. Currently only supports comma separation.
 pArray :: Parser Expr
 pArray = item $ do
-  exprs <- between (schar '[') (schar ']') $ pExpr `sepBy` schar ','
+  exprs <- enclose "[]" $ pExpr `sepEndBy` (schar ',' <|> schar ';')
   return $ Array exprs
+
+-- | Parses an object literal.
+pObject :: Parser Expr
+pObject = go where
+  go = item $ Object <$> (withIndent <|> withBraces)
+  keyValOrJustKey = try keyVal <|> do
+    ident <- pIdent'
+    (,) ident <$> item (pure $ Variable ident)
+  keyVal = (,) <$> pIdent' <* schar ':' <*> pExpr
+  inline = keyVal `sepBy1` schar ','
+  withIndent = indented keyValOrJustKey
+  withBraces = enclose "{}" keyValOrJustKey `sepBy` dividers
+  dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
 
 ---------------------------------------------------
 -----------------  Control flow  ------------------
@@ -423,6 +441,11 @@ sstring s = fmap pack (lexeme $ string s)
 -- | Same as @sstring@ but for chars.
 schar :: Char -> Parser Char
 schar = lexeme . char
+
+-- | Wraps common @between@ usage.
+enclose :: String -> Parser a -> Parser a
+enclose (c1:c2:[]) = between (schar c1) (schar c2)
+enclose _ = error "Argument to `enclose` should be a string of length 2"
 
 -- | Wrapper for an abstract expression parser. Gets the current position,
 -- runs the parser, and stores the result in an `Expr`.
