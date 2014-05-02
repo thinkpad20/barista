@@ -13,10 +13,11 @@ import AST
 
 data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
 data ParserState = ParserState {indents::[Int], debugIndent::Int}
-type Parser = ParsecT String ParserState (WriterT Text Identity)
+type Parser = ParsecT String ParserState (WriterT Text IO)
 
 instance Pretty Expr where
   render (Expr _ e) = render e
+  pretty (Expr _ e) = pretty e
 
 ------------------------------------------------------------
 -------------------  High-level parsers  -------------------
@@ -27,7 +28,7 @@ pTopLevel :: Parser Expr
 pTopLevel = go where
   go = blockOf pStatement >>= \case
     [expr] -> return expr
-    (e:exprs) -> return $ Expr (getPos e) $ Block exprs
+    exprs@(e:_) -> return $ Expr (getPos e) $ Block exprs
 
 -- A collection of statements separated by newlines or semicolons.
 pBlock :: Parser Expr
@@ -40,11 +41,21 @@ pStatement = logged "statement" pExpr
 -- An expression. If statements, unary/binary operations, etc.
 pExpr :: Parser Expr
 pExpr = choice [logged "if" pIf,
-                logged "logical" pLogical]
+                logged "while" pWhile,
+                logged "for" pFor,
+                logged "function" pFunction,
+                logged "assignment" pAssign,
+                logged "logical" pBinaryOp]
 
 -- For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
-pExprOrBlock = pBlock <|> pExpr
+pExprOrBlock = pBlock <|> do
+  e <- pExpr
+  return $ Expr (getPos e) $ Block [e]
+
+-- An inline-only block
+pInlineBlock :: Parser Expr
+pInlineBlock = item $ logged "inline block" $ Block <$> pStatement `sepBy1` schar ';'
 
 -- Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
@@ -64,6 +75,10 @@ pIdent = checkKeyword $ do
   first <- letter <|> char '_' <|> char '@' <|> char '$'
   rest <- many (letter <|> digit <|> char '_' <|> char '$')
   return $ pack (first : rest)
+
+-- | Same as @pIdent@ but skips spaces after.
+pIdent' :: Parser Name
+pIdent' = pIdent <* spaces
 
 -- | Wraps an ident parse in a Variable and records the position.
 pVariable :: Parser Expr
@@ -141,7 +156,7 @@ pRegex = item $ do
 --------------  Classes, functions, literals  --------------
 ------------------------------------------------------------
 
--- | Parses a class.
+-- | Parses a class definition.
 pClass :: Parser Expr
 pClass = item $ Class <$ pKeyword "class" <*> name <*> extends <*> decs where
   name = optionMaybe (pIdent <* spaces)
@@ -165,18 +180,47 @@ pFunction = item $ do
   Function args <$> pExprOrBlock
   where pArgs = schar '(' *> pIdent `sepBy` schar ',' <* char ')'
 
+-- | Parses a variable declaration/assignment.
+pAssign :: Parser Expr
+pAssign = item $ try $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
+
+-- | Patterns are a restricted subset of expressions.
+pPattern :: Parser Expr
+pPattern = choice $ [pCallChain, pArrayOfVariables, pObjectDeref]
+  where pArrayOfVariables = unexpected "not implemented"
+        pObjectDeref = unexpected "not implemented"
+
 ---------------------------------------------------
 -----------------  Control flow  ------------------
 ---------------------------------------------------
 
+-- | If statements.
 pIf :: Parser Expr
-pIf = item $ If <$  pKeyword "if"
+pIf = item $ If <$ pKeyword "if"
                 <*> logged "if condition" pExpr
-                <*> logged "true branch" pThen
+                <*> logged "then branch" pThen
                 <*> logged "else branch" pElse
   where
-    pThen = pBlock <|> pKeyword "then" *> pExpr
     pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
+
+-- | While loops.
+pWhile :: Parser Expr
+pWhile = item $ While <$ pKeyword "while"
+                      <*> logged "while condition" pExpr
+                      <*> logged "while body" pThen
+
+-- | For loops can be either `in` or `of`.
+pFor :: Parser Expr
+pFor = item $ do
+  pKeyword "for"
+  names <- pIdent' `sepBy1` schar ','
+  (pKeyword "in" <|> pKeyword "of") >>= \case
+    "in" -> ForIn names <$> pExpr <*> pThen
+    "of" -> ForOf names <$> pExpr <*> pThen
+
+-- | Used by a few structures to do inlines (if a then b; c; d)
+pThen :: Parser Expr
+pThen = pBlock <|> pKeyword "then" *> pInlineBlock
 
 ------------------------------------------------------------
 ------------  Calling functions and attributes  ------------
@@ -184,11 +228,12 @@ pIf = item $ If <$  pKeyword "if"
 
 -- Function application has low precedence in CoffeeScript,
 -- unless the arguments are not separated by spaces (see below).
--- So we parse a "call chain" (which will )
+-- So we parse a "call chain" (which is space-sensitive) first.
 pCall :: Parser Expr
 pCall = lexeme $ do
   func <- pCallChain
-  args <- logged "function args" $ optionMaybe $ do
+  debug $ "parsed 'func' " <> render func
+  args <- logged "function args" $ optionMaybe $ try $ do
     emptyTuple <|> pExpr `sepBy1` schar ','
   case args of
     Nothing -> return func
@@ -227,6 +272,9 @@ pCallChain = lexeme $ logged "term" pTerm >>= go where
 ---------------  Binary operators  ----------------
 ---------------------------------------------------
 
+-- | Entry point for binary operators.
+pBinaryOp :: Parser Expr
+pBinaryOp = logged "binary operator" pLogical
 
 -- | Lowest level precedence of binary operation are logical operators.
 pLogical :: Parser Expr
@@ -251,9 +299,9 @@ pExponent = pLeftBinary ["**"] pCall
 -- | Left-associative binary parser. Takes a list of operators, and the
 -- next-higher-precedence parser to run first.
 pLeftBinary :: [String] -> Parser Expr -> Parser Expr
-pLeftBinary ops higher = logged ("higher precedence than " <> render ops) higher >>= go where
+pLeftBinary ops higher = higher >>= go where
   ops' :: Parser Text
-  ops' = choice (map pExactSym ops) <* spaces
+  ops' = try $ choice (map pExactSym ops) <* spaces
   go left = spaces *> optionMaybe ops' >>= \case
     Nothing -> return left
     Just op -> do
@@ -355,10 +403,11 @@ item :: Parser (AbsExpr Expr) -> Parser Expr
 item parser = Expr <$> getPosition <*> parser
 
 -- | Parses a given keyword. If it fails, it consumes no input.
-pKeyword :: String -> Parser ()
-pKeyword s = try $ do
-  sstring s
-  notFollowedBy $ (letter <|> digit <|> char '_' <|> char '$')
+pKeyword :: String -> Parser String
+pKeyword s = lexeme $ try $ do
+  kw <- string s
+  notFollowedBy $ choice [letter, digit, char '_', char '$']
+  return kw
 
 -- | Parses the exact symbol given, or consumes nothing.
 pExactSym :: String -> Parser Text
@@ -377,9 +426,9 @@ keywords = fromList
   , "if", "in", "is", "isnt", "new", "return", "switch", "then"
   , "this", "true", "try", "when", "while"]
 
--- | Pulls the abstract expression out of an Expr. Occasionally necessary.
-unExpr :: Expr -> AbsExpr Expr
-unExpr (Expr _ abstr) = abstr
+instance IsExpr Expr where
+  -- | Pulls the abstract expression out of an Expr. Occasionally necessary.
+  unExpr (Expr _ abstr) = abstr
 
 -- | Gets the position out of an expr.
 getPos :: Expr -> SourcePos
@@ -395,11 +444,13 @@ logged desc p = do
   debug $ "Attempting to parse '" <> desc <> "'"
   logInput
   ind <- debugIndent <$> getState
-  debug $ "--indent is at " <> render ind
-  finally (withIndent p) $ do
-    ind <- debugIndent <$> getState
-    debug $  "--done! indent is " <> render ind
-    logInput
+  optionMaybe (try $ withIndent p) >>= \case
+    Nothing -> do
+      debug $ "Failed to parse '" <> desc <> "'"
+      unexpected $ unpack $ "Failed to parse '" <> desc <> "'"
+    Just a -> do
+      debug $ desc <> " succeeded with `" <> render a <> "`"
+      return a
 
 -- | Logs the current remaining input.
 logInput :: Parser ()
@@ -421,15 +472,11 @@ withIndent p = do
 
 -- | Pretty-prints.
 print' :: Pretty a => a -> IO ()
-print' = putStrLn . unpack . render
-
--- | Switch, if on then we won't print logs when we're done.
-hideLogs :: Bool
-hideLogs = False
+print' = putStrLn . unpack . pretty
 
 -- | Guarantees that @action@ will be taken even if @parser@ fails.
 finally :: Parser a -> Parser b -> Parser a
-finally parser action = (parser <* action) <|> (action *> unexpected "failure")
+finally parser action = (try parser <* action) <|> (action *> unexpected "failure")
 
 ----------------------------------------------------------
 -----------------  Running the parser  -------------------
@@ -449,7 +496,7 @@ parse' = fst . parse
 
 -- | Parses a string with a specific parser.
 parseWith :: Parser a -> String -> (Either ParseError a, Text)
-parseWith parser = runIdentity . runWriterT . runParserT parser initState ""
+parseWith parser = unsafePerformIO . runWriterT . runParserT parser initState ""
 
 -- | Parses a file.
 parseFile :: FilePath -> IO (Either ParseError Expr, Text)
@@ -466,9 +513,20 @@ testString = testStringWith pTopLevel
 -- | Tests with a specific parser.
 testStringWith :: Parser Expr -> FilePath -> IO ()
 testStringWith parser s = do
-  let (res, logs) = parseWith parser s
-  when (not hideLogs) $ putStrLn $ unpack logs
+  let (res, _) = parseWith parser s
   case res of
-    Right (Expr _ (Block exprs)) -> mapM_ print' exprs
+    Right expr -> print' expr
+    Left err -> error $ show err
+
+-- | Parses a string and prints the result.
+testStringVerbose :: FilePath -> IO ()
+testStringVerbose = testStringWithVerbose pTopLevel
+
+-- | Tests with a specific parser.
+testStringWithVerbose :: Parser Expr -> FilePath -> IO ()
+testStringWithVerbose parser s = do
+  let (res, logs) = parseWith parser s
+  putStrLn $ unpack logs
+  case res of
     Right expr -> print' expr
     Left err -> error $ show err

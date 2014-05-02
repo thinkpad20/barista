@@ -40,8 +40,10 @@ isInt :: Double -> Bool
 isInt x = isIntTo x 10
 
 class Show a => Pretty a where
+  raw :: a -> Text
+  raw = pack . show
   render :: a -> Text
-  render = pack . show
+  render = raw
   pretty :: a -> Text
   pretty = render
 
