@@ -113,6 +113,8 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
        Function _ _ -> "(" <> render e <> ")"
        _ -> render e
 
+  -- Special case at the top so that we don't indent top-level blocks.
+  pretty (Block es) = intercalate "\n" $ map pretty es
   pretty e = evalState (go e) 0 where
     go :: (IsExpr e, Pretty e) => AbsExpr e -> State Int Text
     go = \case
@@ -120,7 +122,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Number n -> return $ render n
       String s -> return $ render s
       Regex r -> return $ render r
-      EmptyExpr -> return "~(empty expression)~"
+      EmptyExpr -> return ""
       InString s -> error "interp string pretty printing"
       Assign pat expr -> do
         expr' <- go' expr

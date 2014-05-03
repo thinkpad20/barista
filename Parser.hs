@@ -36,7 +36,7 @@ pTopLevel = go <* eof where
 
 -- A collection of statements separated by newlines or semicolons.
 pBlock :: Parser Expr
-pBlock = item $ logged "block" $ Block <$> indented pStatement
+pBlock = item $ logged "block" $ Block <$> indented' pStatement
 
 -- A statement. For now redundant, possibly needed later.
 pStatement :: Parser Expr
@@ -207,7 +207,7 @@ pPattern = choice $ [getVar, pArrayOfVariables, pObjectDeref]
   where pArrayOfVariables = item $ do
           vars <- enclose "[]" $ getVar `sepBy` schar ','
           return $ Array vars
-        getVar = pCallChain >>= \case
+        getVar = pCallChain pVariable >>= \case
           Expr _ (Call _ _) -> unexpected $ "Pattern ended with function call"
           e -> return e
         pObjectDeref = unexpected "not implemented"
@@ -262,7 +262,8 @@ pThen :: Parser Expr
 pThen = pBlock <|> pKeyword "then" *> pInlineBlock
 
 pElse :: Parser (Maybe Expr)
-pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
+pElse = many (nodent <|> emptyLine) *> optionMaybe
+  (pKeyword "else" *> pExprOrBlock)
 
 ------------------------------------------------------------
 ------------  Calling functions and attributes  ------------
@@ -273,7 +274,7 @@ pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
 -- So we parse a "call chain" (which is space-sensitive) first.
 pCall :: Parser Expr
 pCall = lexeme $ do
-  func <- pCallChain
+  func <- pCallChain pTerm
   debug $ "parsed 'func' " <> render func
   args <- logged "function args" $ optionMaybe $ try $ do
     emptyTuple <|> pExpr `sepBy1` schar ','
@@ -283,13 +284,14 @@ pCall = lexeme $ do
 
   where emptyTuple = try $ schar '(' *> char ')' *> pure []
 
--- | This parser will grab a chain of function applications and dots.
+-- | This parser will grab a chain of function applications and dots, given an
+-- initial parser.
 -- For example, `foo.bar().baz(a, b).qux`. In CoffeeScript, there is
 -- a syntactic distinction between `a (b) 1` and `a(b) 1`. The former
 -- means `a(b(1))` and the latter `a(b)(1)`. Similarly, `a[b]` means
 -- `a[b]`, while `a [b]` means `a([b])`. Screwy but whatevs.
-pCallChain :: Parser Expr
-pCallChain = lexeme $ logged "term" pTerm >>= go where
+pCallChain :: Parser Expr -> Parser Expr
+pCallChain start = lexeme $ start >>= go where
   go :: Expr -> Parser Expr
   go expr = do
     lookAhead anyChar >>= \case
@@ -384,6 +386,9 @@ outdent = try $ do
     False -> unexpected "Not an outdent"
   where popIndent = modifyState $ \s -> s {indents = tail $ indents s}
 
+-- | Same as @outdent@, but skips empty lines after.
+outdent' = outdent *> many nodent
+
 -- | Succeeds if there is a new line with the same indentation.
 nodent :: Parser ()
 nodent = try $ do
@@ -396,11 +401,7 @@ nodent = try $ do
 
 -- | Succeeds if there's an empty line (or only whitespace)
 emptyLine :: Parser ()
-emptyLine = try $ do
-  newline
-  spaces
-  lookAhead (char '\n')
-  return ()
+emptyLine = try $ newline *> spaces *> lookAhead (char '\n') *> return ()
 
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
@@ -413,6 +414,10 @@ blockOf p = p `sepEndBy1` same
 -- | Parses an indented block of @p@s.
 indented :: Parser a -> Parser [a]
 indented p = between indent outdent $ blockOf p
+
+-- | Parses an indented block of @p@s, and ski.
+indented' :: Parser a -> Parser [a]
+indented' p = between indent outdent' $ blockOf p
 
 ---------------------------------------------------------
 -----------------------  Comments  ----------------------
@@ -598,5 +603,6 @@ testStringWithVerbose parser s = do
 main :: IO ()
 main = getArgs >>= \case
   "-p":path:_ -> testFile path
+  opt@('-':_):_ -> error $ "Unknown option '" <> opt <> "'"
   input:_ -> testString input
 

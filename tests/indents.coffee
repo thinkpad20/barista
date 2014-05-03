@@ -1,9 +1,9 @@
 grade = (student) ->
   if student.excellentWork
-    "A+"
+    'A+'
   else if student.okayStuff
-    if student.triedHard then "B" else "B-"
+    if student.triedHard then 'B' else 'B-'
   else
-    "C"
+    'C'
 
-eldest = if 24 > 21 then "Liz" else "Ike"
+eldest = if 24 > 21 then 'Liz' else 'Ike'
