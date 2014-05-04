@@ -95,7 +95,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     Comment c -> "# " <> c
     Break -> "break"
     Continue -> "continue"
-    EmptyExpr -> "~(empty expression)~"
+    EmptyExpr -> "### empty expression ###"
     Dotted expr n -> render expr <> "." <> n
     Class name extends decs -> "class" <>
       case name of {Nothing -> ""; Just n -> " " <> n} <>
@@ -115,14 +115,14 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
 
   -- Special case at the top so that we don't indent top-level blocks.
   pretty (Block es) = intercalate "\n" $ map pretty es
-  pretty e = evalState (go e) 0 where
+  pretty e = removeConsecutive '\n' $ evalState (go e) 0 where
     go :: (IsExpr e, Pretty e) => AbsExpr e -> State Int Text
     go = \case
       Variable n -> return n
       Number n -> return $ render n
       String s -> return $ render s
       Regex r -> return $ render r
-      EmptyExpr -> return ""
+      EmptyExpr -> return "# empty line"
       InString s -> error "interp string pretty printing"
       Assign pat expr -> do
         expr' <- go' expr
@@ -214,14 +214,14 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
             return $ "\n" <> mconcat strs
         return $ "class" <> name' <> extends' <> decs'
       e -> error $ "can't render " <> show e
-    line :: Text -> State Int Text
     line txt = do
       level <- get
       when (level < 0) $ error "Illegal indent level"
-      return $ replicate level "  " <> txt <> "\n"
+      return $ replicate level "  " <> txt
+    line' txt = fmap (<> "\n") $ line txt
     indented list f = do
       modify (+1)
-      strs <- forM list $ f >=> line
+      strs <- forM list $ f >=> line'
       modify (\i -> i - 1)
       return $ "\n" <> mconcat strs
     wrap e = go' e >>= \e' -> return $ "(" <> e' <> ")"
@@ -234,6 +234,14 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Postfix _ _ -> wrap e
       Function _ _ -> wrap e
       _ -> go' e
+
+removeConsecutive :: Char -> Text -> Text
+removeConsecutive c input = pack $ scanit $ input' where
+  input' = unpack input
+  scanit [] = []
+  scanit [c] = [c]
+  scanit (c1:c2:rest) | c1 == c && c2 == c = c2 : scanit rest
+                      | otherwise = c1 : scanit (c2 : rest)
 
 instance IsString (InString e) where
   fromString str = Plain $ pack str

@@ -9,7 +9,7 @@ import Text.Parsec hiding (spaces, parse)
 --import System.IO.Unsafe
 import System.Environment
 
-import Common hiding (tail)
+import Common hiding (tail, head)
 import AST
 
 data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
@@ -36,7 +36,7 @@ pTopLevel = go <* eof where
 
 -- A collection of statements separated by newlines or semicolons.
 pBlock :: Parser Expr
-pBlock = item $ logged "block" $ Block <$> indented' pStatement
+pBlock = item $ logged "block" $ Block <$> indented pStatement
 
 -- A statement. For now redundant, possibly needed later.
 pStatement :: Parser Expr
@@ -53,9 +53,7 @@ pExpr = choice [logged "if" pIf,
 
 -- For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
-pExprOrBlock = pBlock <|> pInlineBlock -- <|> do
-  --e <- pExpr
-  --return $ Expr (getPos e) $ Block [e]
+pExprOrBlock = pBlock <|> pInlineBlock
 
 -- An inline-only block
 pInlineBlock :: Parser Expr
@@ -203,33 +201,35 @@ pAssign = item $ try $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
 
 -- | Patterns are a restricted subset of expressions.
 pPattern :: Parser Expr
-pPattern = choice $ [getVar, pArrayOfVariables, pObjectDeref]
-  where pArrayOfVariables = item $ do
-          vars <- enclose "[]" $ getVar `sepBy` schar ','
-          return $ Array vars
-        getVar = pCallChain pVariable >>= \case
-          Expr _ (Call _ _) -> unexpected $ "Pattern ended with function call"
-          e -> return e
-        pObjectDeref = unexpected "not implemented"
+pPattern = choice $ [pCallChain, pArray, objPattern]
+  where objPattern = item $ Object <$> pObjectWithBraces
 
 -- | Parses an array literal. Currently only supports comma separation.
 pArray :: Parser Expr
 pArray = item $ do
-  exprs <- enclose "[]" $ pExpr `sepEndBy` (schar ',' <|> schar ';')
+  exprs <- enclose "[]" $ pExpr `sepEndBy` dividers
   return $ Array exprs
+  where
+    dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
 
 -- | Parses an object literal.
 pObject :: Parser Expr
 pObject = go where
-  go = item $ Object <$> (withIndent <|> withBraces)
-  keyValOrJustKey = try keyVal <|> do
-    ident <- pIdent'
-    (,) ident <$> item (pure $ Variable ident)
-  keyVal = (,) <$> pAnyIdent' <* schar ':' <*> pExpr
+  go = item $ Object <$> (withIndent <|> pObjectWithBraces)
   inline = keyVal `sepBy1` schar ','
   withIndent = indented keyVal
-  withBraces = enclose "{}" keyValOrJustKey `sepBy` dividers
+
+pObjectWithBraces :: Parser [(Name, Expr)]
+pObjectWithBraces = enclose "{}" keyValOrJustKey `sepBy` dividers where
   dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
+
+keyValOrJustKey :: Parser (Name, Expr)
+keyValOrJustKey = try keyVal <|> do
+    ident <- pIdent'
+    (,) ident <$> item (pure $ Variable ident)
+
+keyVal :: Parser (Name, Expr)
+keyVal = (,) <$> pAnyIdent' <* schar ':' <*> pExpr
 
 ---------------------------------------------------
 -----------------  Control flow  ------------------
@@ -274,7 +274,7 @@ pElse = many (nodent <|> emptyLine) *> optionMaybe
 -- So we parse a "call chain" (which is space-sensitive) first.
 pCall :: Parser Expr
 pCall = lexeme $ do
-  func <- pCallChain pTerm
+  func <- pCallChain
   debug $ "parsed 'func' " <> render func
   args <- logged "function args" $ optionMaybe $ try $ do
     emptyTuple <|> pExpr `sepBy1` schar ','
@@ -284,14 +284,13 @@ pCall = lexeme $ do
 
   where emptyTuple = try $ schar '(' *> char ')' *> pure []
 
--- | This parser will grab a chain of function applications and dots, given an
--- initial parser.
+-- | This parser will grab a chain of function applications and dots.
 -- For example, `foo.bar().baz(a, b).qux`. In CoffeeScript, there is
 -- a syntactic distinction between `a (b) 1` and `a(b) 1`. The former
 -- means `a(b(1))` and the latter `a(b)(1)`. Similarly, `a[b]` means
 -- `a[b]`, while `a [b]` means `a([b])`. Screwy but whatevs.
-pCallChain :: Parser Expr -> Parser Expr
-pCallChain start = lexeme $ start >>= go where
+pCallChain :: Parser Expr
+pCallChain = lexeme $ pTerm >>= go where
   go :: Expr -> Parser Expr
   go expr = do
     lookAhead anyChar >>= \case
@@ -386,9 +385,6 @@ outdent = try $ do
     False -> unexpected "Not an outdent"
   where popIndent = modifyState $ \s -> s {indents = tail $ indents s}
 
--- | Same as @outdent@, but skips empty lines after.
-outdent' = outdent *> many nodent
-
 -- | Succeeds if there is a new line with the same indentation.
 nodent :: Parser ()
 nodent = try $ do
@@ -401,7 +397,8 @@ nodent = try $ do
 
 -- | Succeeds if there's an empty line (or only whitespace)
 emptyLine :: Parser ()
-emptyLine = try $ newline *> spaces *> lookAhead (char '\n') *> return ()
+emptyLine = try $ newline *> spaces *> finish where
+  finish = (lookAhead (char '\n') *> return ()) <|> (pLineComment >> return ())
 
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
@@ -409,15 +406,11 @@ same = nodent <|> (schar ';' *> return ()) <|> emptyLine
 
 -- | Parses its argument one or more times, separated by @same@.
 blockOf :: Parser a -> Parser [a]
-blockOf p = p `sepEndBy1` same
+blockOf p = p `sepEndBy1` (many1 same)
 
 -- | Parses an indented block of @p@s.
 indented :: Parser a -> Parser [a]
 indented p = between indent outdent $ blockOf p
-
--- | Parses an indented block of @p@s, and ski.
-indented' :: Parser a -> Parser [a]
-indented' p = between indent outdent' $ blockOf p
 
 ---------------------------------------------------------
 -----------------------  Comments  ----------------------
@@ -515,12 +508,15 @@ logged desc p = do
       unexpected $ unpack $ "Failed to parse '" <> desc <> "'"
     Just a -> do
       debug $ desc <> " succeeded with `" <> render a <> "`"
+      logInput
       return a
 
 -- | Logs the current remaining input.
 logInput :: Parser ()
 logInput = do input <- getInput
               debug $ "Remaining input: " <> pack (show input)
+              level <- head . indents <$> getState
+              debug $ "Indentation level: " <> render level
 
 -- | Logs a message. Indents it according to the level.
 debug :: Text -> Parser ()
@@ -591,6 +587,10 @@ testStringWith parser s = case parseWith parser s of
 testStringVerbose :: FilePath -> IO ()
 testStringVerbose = testStringWithVerbose pTopLevel
 
+-- | Parses a string and prints the result.
+testFileVerbose :: FilePath -> IO ()
+testFileVerbose = readFile >=> testStringWithVerbose pTopLevel
+
 -- | Tests with a specific parser.
 testStringWithVerbose :: Parser Expr -> FilePath -> IO ()
 testStringWithVerbose parser s = do
@@ -605,4 +605,5 @@ main = getArgs >>= \case
   "-p":path:_ -> testFile path
   opt@('-':_):_ -> error $ "Unknown option '" <> opt <> "'"
   input:_ -> testString input
+  _ -> putStrLn "Please provide arguments!"
 
