@@ -19,6 +19,7 @@ data AbsExpr expr = Variable Name
                   | Object [(Name, expr)]
                   | ObjectDeref expr expr
                   | Function [Name] expr
+                  | FatArrowFunction [Name] expr
                   | Dotted expr Name
                   | Call expr [expr]
                   | Binary Name expr expr
@@ -27,12 +28,15 @@ data AbsExpr expr = Variable Name
                   | Return (Maybe expr)
                   | Throw expr
                   | New expr
-                  | Switch expr [SwitchCase expr]
+                  | Switch expr [([expr], expr)] (Maybe expr)
                   | If expr expr (Maybe expr)
+                  | Unless expr expr
                   | ForIn [Name] expr expr
                   | ForOf [Name] expr expr
+                  | ForInComp expr [Name] expr
+                  | ForOfComp expr [Name] expr
                   | While expr expr
-                  | TryCatch expr Name expr (Maybe expr)
+                  | TryCatch expr (Maybe (Name, expr)) (Maybe expr)
                   | Do [Name] expr
                   | Comment Text
                   | Break
@@ -53,11 +57,7 @@ data ClassDec expr = ClassDecExpr expr
                    | ClassDecDef Name expr
                    deriving (Show, Eq)
 
-data SwitchCase expr = When [expr] expr
-                     | Else expr
-                     deriving (Show, Eq)
-
-instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
+instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
   render = \case
     Variable n -> n
     Number n -> render n
@@ -65,8 +65,8 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     Regex r -> render r
     InString s -> error "interp string rendering"
     Assign pat expr -> render pat <> " = " <> render expr <> ";"
-    Block exprs -> "{" <> intercalate "; " (map render exprs) <> "}"
-    Array exprs -> "[" <> intercalate ", " (map render exprs) <> "]"
+    Block exprs -> "{" <> imapr "; " exprs <> "}"
+    Array exprs -> "[" <> imapr ", " exprs <> "]"
     ArrayRange e1 e2 -> "[" <> render e1 <> " .. " <> render e2 <> "]"
     ObjectDeref e ref -> render e <> "[" <> render ref <> "]"
     Object pairs -> "{" <> intercalate ", " (map renderP pairs) <> "}"
@@ -76,7 +76,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       let func = render' expr
       case exprs of
         [] -> func <> "()"
-        exprs -> func <> " " <> intercalate ", " (map render exprs)
+        exprs -> func <> " " <> imapr "," exprs
     Binary op e1 e2 -> "(" <> render e1 <> ") " <> op <> " (" <> render e2 <> ")"
     Prefix op expr -> op <> render expr
     Postfix expr op -> render expr <> op
@@ -84,14 +84,24 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
     Return (Just expr) -> "return " <> render expr
     Throw expr -> "throw " <> render expr
     New expr -> "new " <> render expr
-    Switch expr cases -> error "switch rendering"
+    Switch expr cases _else -> rswitch expr cases _else
     If c t Nothing -> "if " <> render c <> " then " <> render t
     If c t (Just f) -> "if " <> render c <> " then " <> render t <> " else " <> render f
     ForIn pat e1 e2 -> "for " <> intercalate ", " pat <> " in "
                               <> render e1 <> render e2
-    ForOf pat e1 e2 -> error "for/of rendering"
+    ForOf pat e1 e2 -> "for " <> intercalate ", " pat <> " of "
+                              <> render e1 <> render e2
+    ForInComp e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
+                                     <> " in " <> render e2
+    ForOfComp e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
+                                     <> " of " <> render e2
     While cond expr -> "while " <> render cond <> render expr
-    TryCatch e1 name e2 finally -> error "try/catch rendering"
+    TryCatch e c f -> do
+      let catch = case c of Nothing -> ""
+                            Just c -> "catch " <> render c
+      let finally = case f of Nothing -> ""
+                              Just f -> "finally " <> render f
+      "try " <> render e <> catch <> finally
     Comment c -> "# " <> c
     Break -> "break"
     Continue -> "continue"
@@ -103,20 +113,27 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       case decs of {[] -> ""; ds -> "{" <> intercalate "; " (map render ds) <> "}"}
     e -> error $ "can't render " <> show e
     where
-     renderP (name, expr) = name <> ":" <> render (unExpr expr)
-     render' :: (Pretty e, IsExpr e) => e -> Text
-     render' e = case unExpr e of
-       Binary _ _ _ -> "(" <> render e <> ")"
-       Call _ _ -> "(" <> render e <> ")"
-       Prefix _ _ -> "(" <> render e <> ")"
-       Postfix _ _ -> "(" <> render e <> ")"
-       Function _ _ -> "(" <> render e <> ")"
-       _ -> render e
+      mapr = map render
+      imapr t = intercalate t . mapr
+      renderP (name, expr) = name <> ":" <> render (unExpr expr)
+      rswitch expr cases _else = do
+        let rcase (es, res) = "when " <> imapr "," es <> " then " <> render res
+        let relse e = case e of {Nothing -> ""; Just e -> "else " <> render e}
+        "switch " <> render expr <> "{" <> intercalate "," (map rcase cases)
+                                 <> relse _else
+      render' :: (Render e, IsExpr e) => e -> Text
+      render' e = case unExpr e of
+        Binary _ _ _ -> "(" <> render e <> ")"
+        Call _ _ -> "(" <> render e <> ")"
+        Prefix _ _ -> "(" <> render e <> ")"
+        Postfix _ _ -> "(" <> render e <> ")"
+        Function _ _ -> "(" <> render e <> ")"
+        _ -> render e
 
   -- Special case at the top so that we don't indent top-level blocks.
   pretty (Block es) = intercalate "\n" $ map pretty es
   pretty e = removeConsecutive '\n' $ evalState (go e) 0 where
-    go :: (IsExpr e, Pretty e) => AbsExpr e -> State Int Text
+    go :: (IsExpr e, Render e) => AbsExpr e -> State Int Text
     go = \case
       Variable n -> return n
       Number n -> return $ render n
@@ -145,6 +162,9 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Function names expr -> do
         let start = "(" <> intercalate ", " names <> ") -> "
         mappend start <$> go' expr
+      FatArrowFunction names expr -> do
+        let start = "(" <> intercalate ", " names <> ") => "
+        mappend start <$> go' expr
       Call expr exprs -> go'' expr >>= \e -> case exprs of
         [] -> return $ e <> "()"
         exprs -> do
@@ -160,16 +180,18 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       Return (Just expr) -> ("return " <>) <$> go' expr
       Throw expr -> ("throw " <>) <$> go' expr
       New expr -> ("new " <>) <$> go' expr
-      Switch expr cases -> do
+      Switch expr cases _else -> do
         expr' <- go' expr
-        cases' <- indented cases $ \case
-          When es res -> do
-            es' <- mapM go' es
-            res' <- go' res
-            return $ "when " <> intercalate ", " es' <> res'
-          Else res ->
-            fmap ("else " <>) $ go' res
-        return $ "switch " <> expr' <> cases'
+        cases' <- indented cases $ \(es, res) -> do
+          es' <- mapM go' es
+          res' <- go' res
+          return $ "when " <> intercalate ", " es' <> res'
+        _else' <- case _else of
+          Nothing -> return ""
+          Just expr -> indented [expr] $ \e -> do
+            e' <- go' e
+            return $ "else " <> e'
+        return $ "switch " <> expr' <> cases' <> _else'
       If c t f -> do
         c' <- go' c
         t' <- go' t
@@ -187,11 +209,27 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
         e1' <- go' e1
         e2' <- go' e2
         return $ "for " <> intercalate ", " pat <> " of " <> e1' <> e2'
+      ForInComp e1 names e2 -> do
+        e1' <- go' e1
+        e2' <- go' e2
+        return $ e1' <> " for " <> intercalate ", " names <> " in " <> e2'
+      ForOfComp e1 names e2 -> do
+        e1' <- go' e1
+        e2' <- go' e2
+        return $ e1' <> " for " <> intercalate ", " names <> " of " <> e2'
       While cond expr -> do
         cond' <- go' cond
         expr' <- go' expr
         return $ "while " <> cond' <> expr'
-      TryCatch e1 name e2 finally -> error "try/catch rendering"
+      TryCatch e c f -> do
+        e' <- go' e
+        catch <- case c of Nothing -> return ""
+                           Just (name, c) -> do
+                             c' <- go' c
+                             pure $ "catch " <> name <> " " <> c' <> "\n"
+        finally <- case f of Nothing -> return ""
+                             Just f -> fmap ("finally " <>) $ go' f
+        return $ "try " <> e' <> catch <> finally
       Comment c -> return $ "# " <> c
       Break -> return "break"
       Continue -> return "continue"
@@ -213,7 +251,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
             modify (\i -> i - 1)
             return $ "\n" <> mconcat strs
         return $ "class" <> name' <> extends' <> decs'
-      e -> error $ "can't render " <> show e
+      e -> error $ "can't pretty print " <> show e
     line txt = do
       level <- get
       when (level < 0) $ error "Illegal indent level"
@@ -225,7 +263,7 @@ instance (IsExpr expr, Pretty expr) => Pretty (AbsExpr expr) where
       modify (\i -> i - 1)
       return $ "\n" <> mconcat strs
     wrap e = go' e >>= \e' -> return $ "(" <> e' <> ")"
-    go' :: (IsExpr e, Pretty e) => e -> State Int Text
+    go' :: (IsExpr e, Render e) => e -> State Int Text
     go' = go . unExpr
     go'' e = case unExpr e of
       Binary _ _ _ -> wrap e
@@ -246,7 +284,7 @@ removeConsecutive c input = pack $ scanit $ input' where
 instance IsString (InString e) where
   fromString str = Plain $ pack str
 
-instance Pretty e => Pretty (ClassDec e) where
+instance Render e => Render (ClassDec e) where
   render (ClassDecExpr e) = render e
   render (ClassDecDef name e) = name <> ":" <> render e
 
@@ -265,8 +303,8 @@ validSymbols = fromList
 symChars :: String
 symChars = "+*-/|&><=@?"
 
-instance Pretty a => Pretty (Maybe a) where
+instance Render a => Render (Maybe a) where
   render Nothing = "Nothing"
   render (Just a) = "Just " <> render a
 
-instance Pretty Int
+instance Render Int

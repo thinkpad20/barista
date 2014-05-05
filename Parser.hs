@@ -6,7 +6,6 @@ module Parser where
 
 import Prelude hiding (replicate)
 import Text.Parsec hiding (spaces, parse)
---import System.IO.Unsafe
 import System.Environment
 
 import Common hiding (tail, head)
@@ -16,7 +15,7 @@ data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
 data ParserState = ParserState {indents::[Int], debugIndent::Int}
 type Parser = ParsecT String ParserState (WriterT Text Identity)
 
-instance Pretty Expr where
+instance Render Expr where
   render (Expr _ e) = render e
   pretty (Expr _ e) = pretty e
 
@@ -27,47 +26,50 @@ instance IsExpr Expr where
 -------------------  High-level parsers  -------------------
 ------------------------------------------------------------
 
--- Entry point parser.
+-- | Entry point parser.
 pTopLevel :: Parser Expr
 pTopLevel = go <* eof where
-  go = blockOf pStatement >>= \case
+  go = logged "main" (blockOf pStatement) >>= \case
     [expr] -> return expr
     exprs@(e:_) -> return $ Expr (getPos e) $ Block exprs
 
--- A collection of statements separated by newlines or semicolons.
+-- | A collection of statements separated by newlines or semicolons.
 pBlock :: Parser Expr
-pBlock = item $ logged "block" $ Block <$> indented pStatement
+pBlock = item . logged "block" $ Block <$> indented pStatement
 
--- A statement. For now redundant, possibly needed later.
+-- | A statement. Possibly nothing.
 pStatement :: Parser Expr
-pStatement = logged "statement" pExpr <|> item (return EmptyExpr)
+pStatement = logged "statement" $ pExpr <|> item' EmptyExpr
 
--- An expression. If statements, unary/binary operations, etc.
+-- | An expression. If statements, unary/binary operations, etc.
 pExpr :: Parser Expr
-pExpr = choice [logged "if" pIf,
-                logged "while" pWhile,
-                logged "for" pFor,
-                logged "function" pFunction,
-                logged "assignment" pAssign,
-                logged "logical" pBinaryOp]
+pExpr = choice [ -- logged "if"          pIf
+               --, logged "while"       pWhile
+               --, logged "for"         pFor
+               --, logged "switch"      pSwitch
+               --, logged "try/catch"   pTryCatch
+                 logged "function"    pFunction
+               , logged "assignment"  pAssign
+               , logged "bare object" pBareObject
+               --, logged "newed"       pNew
+               --, logged "return"      pReturn
+               --, logged "break"       pBreak
+               --, logged "continue"    pContinue
+               , logged "logical"     pBinaryOp]
 
--- For when either an expression or a block a block is valid.
+-- | For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
 pExprOrBlock = pBlock <|> pInlineBlock
 
--- An inline-only block
+-- | An inline-only block
 pInlineBlock :: Parser Expr
-pInlineBlock = item $ logged "inline block" $ Block <$> pStatement `sepBy1` schar ';'
+pInlineBlock = item $ Block <$> pStatement `sepBy1` schar ';'
 
--- Smallest unit (lower than function application or binary).
+-- | Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
-pTerm = choice [pVariable,
-                pNumber,
-                pString,
-                pParens,
-                pArray]
+pTerm = choice [ pVariable, pNumber, pString, pParens, pArray, pObject]
 
--- An expression wrapped in parentheses.
+-- | An expression wrapped in parentheses.
 pParens :: Parser Expr
 pParens = enclose "()" pExpr
 
@@ -116,7 +118,7 @@ pNumber = item $ do
 pInString :: Parser Expr
 pInString = item $ InString <$> (char '"' *> go) where
   go = do
-    str <- fmap pack (anyChar `manyTill` (lookAhead $ oneOf "\\\"#"))
+    str <- strTill (oneOf "\\\"#")
     let escape c = (Plain (str `snoc` c) <>) <$> go
     oneOf "\\\"#" >>= \case
       '\\' -> anyChar >>= \case
@@ -140,7 +142,7 @@ pInString = item $ InString <$> (char '"' *> go) where
 pRegString :: Parser Expr
 pRegString = item $ String <$> (char '\'' >> go) where
   go = do
-    str <- fmap pack (anyChar `manyTill` (lookAhead $ oneOf "\\'"))
+    str <- strTill (oneOf "\\'")
     let escape c = ((str `snoc` c) <>) <$> go
     oneOf "\\'" >>= \case
       '\\' -> anyChar >>= \case
@@ -155,17 +157,22 @@ pRegString = item $ String <$> (char '\'' >> go) where
       '\'' -> return str
       c -> error $ "wtf is " <> [c]
 
+--pLongString :: Parser Text
+--pLongString = item $ do
+--  string "'''"
+--  text <- anyChar `manyTill` (lookAhead)
+
 -- | Parses either a regular string, or an interpolated one
 pString :: Parser Expr
-pString = pRegString <|> pInString
+pString = pRegString <|> pInString -- <|> pLongString
 
 -- | Parses a regex.
 pRegex :: Parser Expr
 pRegex = item $ do
   char '/'
   lookAhead anyChar >>= \case
-    ' ' -> unexpected $ "Not a regex"
-    c -> Regex . pack <$> noneOf "/" `manyTill` try (char '/')
+    ' ' -> unexpected "Not a regex"
+    c -> Regex <$> strTillConsume (char '/')
 
 ------------------------------------------------------------
 --------------  Classes, functions, literals  --------------
@@ -188,16 +195,19 @@ pClassDec = choice [ try $ ClassDecDef <$> pIdent <* schar ':' <*> pExpr
 -- | Parses a function declaration.
 pFunction :: Parser Expr
 pFunction = item $ do
-  args <- optionMaybe pArgs <* spaces >>= \case
+  args <- optionMaybe pArgs >>= \case
     Nothing -> return []
     Just as -> return as
-  sstring "->"
-  Function args <$> (pExprOrBlock <|> item (return EmptyExpr))
-  where pArgs = schar '(' *> pIdent `sepBy` schar ',' <* char ')'
+  arrow <- sstring "->" <|> sstring "=>"
+  body <- pExprOrBlock <|> item' EmptyExpr
+  return $ case arrow of
+    "->" -> Function args body
+    "=>" -> FatArrowFunction args body
+  where pArgs = schar '(' *> pIdent `sepBy` schar ',' <* schar ')'
 
 -- | Parses a variable declaration/assignment.
 pAssign :: Parser Expr
-pAssign = item $ try $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
+pAssign = itry $ Assign <$> pPattern <* pExactSym "=" <*> pExpr
 
 -- | Patterns are a restricted subset of expressions.
 pPattern :: Parser Expr
@@ -207,29 +217,43 @@ pPattern = choice $ [pCallChain, pArray, objPattern]
 -- | Parses an array literal. Currently only supports comma separation.
 pArray :: Parser Expr
 pArray = item $ do
-  exprs <- enclose "[]" $ pExpr `sepEndBy` dividers
+  exprs <- enclose "[]" $ pExpr `sepEndBy` pObjectDivider
   return $ Array exprs
-  where
-    dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
 
 -- | Parses an object literal.
 pObject :: Parser Expr
 pObject = go where
   go = item $ Object <$> (withIndent <|> pObjectWithBraces)
   inline = keyVal `sepBy1` schar ','
-  withIndent = indented keyVal
+  withIndent = logged "indented keyval" $ indented keyVal
 
+-- | Parses an object using curly braces.
 pObjectWithBraces :: Parser [(Name, Expr)]
-pObjectWithBraces = enclose "{}" keyValOrJustKey `sepBy` dividers where
-  dividers = schar ',' <|> (many1 (schar ';' <|> schar '\n') >> return ',')
+pObjectWithBraces = enclose "{}" $ keyValOrJustKey `sepBy` pObjectDivider
 
+-- | Parses a "bare object", that is, one that isn't preceeded by indents or
+-- curly braces.
+pBareObject :: Parser Expr
+pBareObject = item $ Object <$> (kv >>= go) where
+  kv = logged "key/value pair" $ try keyVal
+  go k = option [k] $ try $ do
+    -- Will not consume the object divider UNLESS it parses another keyval.
+    fmap (k :) (pObjectDivider *> keyVal >>= go)
+
+-- | Parses the separaters in an object: line breaks, commas, or semicolons.
+pObjectDivider :: Parser ()
+pObjectDivider = choice [ignore $ schar ',',
+                         ignore $ many1 $ schar ';' <|> schar '\n']
+
+-- | In CoffeeScript, if in a dictionary we write just a key @foo@, it's the
+-- same as writing @foo: foo@.
 keyValOrJustKey :: Parser (Name, Expr)
 keyValOrJustKey = try keyVal <|> do
     ident <- pIdent'
-    (,) ident <$> item (pure $ Variable ident)
+    (,) ident <$> item' (Variable ident)
 
 keyVal :: Parser (Name, Expr)
-keyVal = (,) <$> pAnyIdent' <* schar ':' <*> pExpr
+keyVal = (,) <$> pAnyIdent' <* schar ':' <*> logged "obj value" pExpr
 
 ---------------------------------------------------
 -----------------  Control flow  ------------------
@@ -251,19 +275,64 @@ pWhile = item $ While <$ pKeyword "while"
 -- | For loops, two kinds: either `in` or `of`.
 pFor :: Parser Expr
 pFor = item $ do
+  debug "trying to get keyword for"
   pKeyword "for"
+  debug "trying to get identifiers"
   names <- pIdent' `sepBy1` schar ','
   (pKeyword "in" <|> pKeyword "of") >>= \case
     "in" -> ForIn names <$> pExpr <*> pThen
     "of" -> ForOf names <$> pExpr <*> pThen
 
+-- | For loops, two kinds: either `in` or `of`.
+pForComprehension :: Parser Expr
+pForComprehension = pExpr >>= go where
+  go expr = do
+    debug $ "got an expression " <> render expr <> ", now trying to get a for"
+    logInput
+    option expr $ item $ do
+      pKeyword "for"
+      names <- pIdent' `sepBy1` schar ','
+      (pKeyword "in" <|> pKeyword "of") >>= \case
+        "in" -> ForInComp expr names <$> pExpr
+        "of" -> ForOfComp expr names <$> pExpr
+
 -- | Used by a few structures to do inlines (if a then b; c; d)
 pThen :: Parser Expr
 pThen = pBlock <|> pKeyword "then" *> pInlineBlock
 
+-- | Parses an 'else'. Used by @pIf@ and @pSwitch@.
 pElse :: Parser (Maybe Expr)
-pElse = many (nodent <|> emptyLine) *> optionMaybe
+pElse = many nodent *> optionMaybe
   (pKeyword "else" *> pExprOrBlock)
+
+-- | Parses a switch statement.
+pSwitch :: Parser Expr
+pSwitch = item $ do
+  pKeyword "switch"
+  cond <- pExpr
+  (cases, _else) <- getCases
+  return $ Switch cond cases _else
+  where sCase :: Parser ([Expr], Expr)
+        sCase = (,) <$ pKeyword "when" <*> pExpr `sepBy1` schar ',' <*> pThen
+        getCases = do
+          indent
+          cases <- blockOf sCase
+          _else <- pElse
+          outdent
+          return (cases, _else)
+
+-- | Parses a try/catch/finally.
+pTryCatch :: Parser Expr
+pTryCatch = item $ TryCatch <$ pKeyword "try" <*> toTry <*> catch <*> finally
+  where
+    toTry = pExprOrBlock
+    catch = optionMaybe $ do
+      pKeyword "catch"
+      name <- pIdent'
+      expr <- pThen <|> item' EmptyExpr
+      return (name, expr)
+    finally = optionMaybe $
+      pKeyword "finally" *> (pExprOrBlock <|> item' EmptyExpr)
 
 ------------------------------------------------------------
 ------------  Calling functions and attributes  ------------
@@ -288,7 +357,7 @@ pCall = lexeme $ do
 -- For example, `foo.bar().baz(a, b).qux`. In CoffeeScript, there is
 -- a syntactic distinction between `a (b) 1` and `a(b) 1`. The former
 -- means `a(b(1))` and the latter `a(b)(1)`. Similarly, `a[b]` means
--- `a[b]`, while `a [b]` means `a([b])`. Screwy but whatevs.
+-- `a[b]`, while `a [b]` means `a([b])`.
 pCallChain :: Parser Expr
 pCallChain = lexeme $ pTerm >>= go where
   go :: Expr -> Parser Expr
@@ -318,6 +387,26 @@ pCallChain = lexeme $ pTerm >>= go where
     <|> return expr
 
 ---------------------------------------------------
+------------  Keyworded expressions  --------------
+---------------------------------------------------
+
+-- | A new'ed expression
+pNew :: Parser Expr
+pNew = item $ New <$ pKeyword "new" <*> pExpr
+
+-- | A returned expression
+pReturn :: Parser Expr
+pReturn = item $ Return <$ pKeyword "return" <*> optionMaybe pExpr
+
+-- | A break statement
+pBreak :: Parser Expr
+pBreak = item $ Break <$ pKeyword "break"
+
+-- | A continue statement
+pContinue :: Parser Expr
+pContinue = item $ Continue <$ pKeyword "continue"
+
+---------------------------------------------------
 ---------------  Binary operators  ----------------
 ---------------------------------------------------
 
@@ -331,7 +420,7 @@ pLogical = pLeftBinary ["&&", "||", "and", "or"] pComparative
 
 -- | Comparisons are next higher precedence
 pComparative :: Parser Expr
-pComparative = pLeftBinary ["<", ">", "<=", ">=", "==", "!="] pAdditive
+pComparative = pLeftBinary ["<", ">", "<=", ">=", "==", "!=", "is", "isnt"] pAdditive
 
 -- | Addition, subtraction
 pAdditive :: Parser Expr
@@ -363,9 +452,10 @@ pLeftBinary ops higher = higher >>= go where
 
 -- | Succeeds if indentation has increased.
 indent :: Parser ()
-indent = try $ do
+indent = logged "an indent" $ try $ do
   newline
   newIndent <- length <$> many (char ' ')
+  debug $ "the new indent is " <> render newIndent
   oldIndent:_ <- indents <$> getState
   case newIndent > oldIndent of
     True -> pushIndent newIndent
@@ -374,7 +464,7 @@ indent = try $ do
 
 -- | Succeeds if indentation has decreased. Doesn't consume input.
 outdent :: Parser ()
-outdent = try $ do
+outdent = logged "an outdent" $ try $ do
   isOutdent <- (eof >> return True) <|> lookAhead (
     do newline
        newIndent <- length <$> many (char ' ')
@@ -393,39 +483,65 @@ nodent = try $ do
   oldIndent:_ <- indents <$> getState
   case newIndent == oldIndent of
     True -> return ()
-    False -> unexpected "Not an nodent"
+    False -> unexpected "Not a nodent"
 
--- | Succeeds if there's an empty line (or only whitespace)
+-- | Succeeds if there's an empty line, one with only whitespace, or a comment
 emptyLine :: Parser ()
-emptyLine = try $ newline *> spaces *> finish where
-  finish = (lookAhead (char '\n') *> return ()) <|> (pLineComment >> return ())
+emptyLine = try $ newline >> spaces >> finish where
+  finish = ignore (lookAhead (char '\n')) <|> ignore pLineComment
+
+---- | Same as @emptyLine@, but doesn't require an initial newline. Does not
+---- consume the trailing newline.
+--emptyLine' :: Parser ()
+--emptyLine' = try $ spaces *> logged "finishing an empty line" finish where
+--  finish = ignore (lookAhead (char '\n')) <|> ignore pLineComment <|> lookAhead eof
 
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
-same = nodent <|> (schar ';' *> return ()) <|> emptyLine
+same = nodent <|> ignore (schar ';')
 
 -- | Parses its argument one or more times, separated by @same@.
 blockOf :: Parser a -> Parser [a]
-blockOf p = p `sepEndBy1` (many1 same)
+blockOf p = p `sepBy1` (many emptyLine >> same)
 
 -- | Parses an indented block of @p@s.
 indented :: Parser a -> Parser [a]
 indented p = between indent outdent $ blockOf p
 
+ignore :: Parser a -> Parser ()
+ignore p = p >> return ()
+
+perhaps :: Parser a -> Parser ()
+perhaps = ignore . optionMaybe
+
+--skip = spaces *> emptyLine' `sepEndBy` newline
+
+-- | Grabs any character until the stopping parser. Doesn't consume @stop@.
+strTill :: Parser a -> Parser Text
+strTill stop = fmap pack $ anyChar `manyTill` lookAhead stop
+
+-- | Same as @strTill@, but consumes the stopping parser.
+strTillConsume :: Parser a -> Parser Text
+strTillConsume stop = fmap pack $ anyChar `manyTill` try stop
+
+-- | For block comments and long strings.
+blockStr :: String -> Parser Text
+blockStr start = try (string start) >> strTillConsume (string start)
+
 ---------------------------------------------------------
 -----------------------  Comments  ----------------------
 ---------------------------------------------------------
 
-pLineComment :: Parser Text
-pLineComment = do
+pComment :: Parser Expr
+pComment = pLineComment <|> pBlockComment
+
+pLineComment :: Parser Expr
+pLineComment = item $ logged "line comment" $ do
   char '#'
-  pack <$> manyTill anyChar (lookAhead $ char '\n')
+  Comment <$> strTill (char '\n')
 
 pBlockComment :: Parser Expr
-pBlockComment = item $ do
-  try $ string "###"
-  body <- manyTill anyChar (try $ string "###")
-  pure $ Comment $ pack body
+pBlockComment = item $ Comment <$> blockStr "###"
 
 ---------------------------------------------------------
 -----------------------  Helpers  -----------------------
@@ -443,6 +559,23 @@ anySpaces = (many $ oneOf " \t\n\r") *> return ()
 lexeme :: Parser a -> Parser a
 lexeme parser = parser <* spaces
 
+-- | Tries, and if successful then skips spaces.
+ltry :: Parser a -> Parser a
+ltry = lexeme . try
+
+-- | Wrapper for an abstract expression parser. Gets the current position,
+-- runs the parser, and stores the result in an `Expr`.
+item :: Parser (AbsExpr Expr) -> Parser Expr
+item parser = Expr <$> getPosition <*> parser
+
+-- | Lifts the intended thing into the context and records the position.
+item' :: (AbsExpr Expr) -> Parser Expr
+item' = item . return
+
+-- | Tries, and if successful records the position.
+itry :: Parser (AbsExpr Expr) -> Parser Expr
+itry = item . try
+
 -- | String + following whitespace.
 sstring :: String -> Parser Text
 sstring s = fmap pack (lexeme $ string s)
@@ -456,24 +589,13 @@ enclose :: String -> Parser a -> Parser a
 enclose (c1:c2:[]) = between (schar c1) (schar c2)
 enclose _ = error "Argument to `enclose` should be a string of length 2"
 
--- | Wrapper for an abstract expression parser. Gets the current position,
--- runs the parser, and stores the result in an `Expr`.
-item :: Parser (AbsExpr Expr) -> Parser Expr
-item parser = Expr <$> getPosition <*> parser
-
 -- | Parses a given keyword. If it fails, it consumes no input.
 pKeyword :: String -> Parser Text
-pKeyword s = exactly s (choice [letter, digit, char '_', char '$'])
+pKeyword s = ltry $ pack <$> string s <* notFollowedBy identChar
 
 -- | Parses the exact symbol given, or consumes nothing.
 pExactSym :: String -> Parser Text
-pExactSym s = exactly s (oneOf symChars)
-
-exactly :: Show a => String -> Parser a -> Parser Text
-exactly s others = lexeme $ try $ do
-  res <- string s
-  notFollowedBy others
-  return $ pack res
+pExactSym s = ltry $ pack <$> string s <* notFollowedBy (oneOf symChars)
 
 -- | Fails if the parsed identifier is a keyword.
 checkKeyword :: Parser Text -> Parser Text
@@ -488,6 +610,10 @@ keywords = fromList
   , "if", "in", "is", "isnt", "new", "return", "switch", "then"
   , "this", "true", "try", "when", "while"]
 
+-- | Parses any character valid in an identifier.
+identChar :: Parser Char
+identChar = choice [letter, digit, char '_', char '$']
+
 -- | Gets the position out of an expr.
 getPos :: Expr -> SourcePos
 getPos (Expr pos _) = pos
@@ -497,17 +623,18 @@ getPos (Expr pos _) = pos
 ----------------------------------------------------------
 
 -- | Wraps a parser with some logging.
-logged :: Pretty a => Text -> Parser a -> Parser a
+logged :: Render a => Text -> Parser a -> Parser a
 logged desc p = do
   debug $ "Attempting to parse '" <> desc <> "'"
   logInput
   ind <- debugIndent <$> getState
-  optionMaybe (try $ withIndent p) >>= \case
+  (optionMaybe . try . withIndent) p >>= \case
     Nothing -> do
       debug $ "Failed to parse '" <> desc <> "'"
       unexpected $ unpack $ "Failed to parse '" <> desc <> "'"
     Just a -> do
-      debug $ desc <> " succeeded with `" <> render a <> "`"
+      debug $ "+++++++++++++++++++++++++++++ " <> desc
+              <> " succeeded with `" <> render a <> "`"
       logInput
       return a
 
@@ -531,8 +658,8 @@ withIndent p = do
   modifyState $ \s -> s {debugIndent = debugIndent s + 1}
   finally p $ modifyState $ \s -> s {debugIndent = debugIndent s - 1}
 
--- | Pretty-prints.
-print' :: Pretty a => a -> IO ()
+-- | Render-prints.
+print' :: Render a => a -> IO ()
 print' = putStrLn . unpack . pretty
 
 -- | Guarantees that @action@ will be taken even if @parser@ fails.
@@ -573,28 +700,33 @@ testFile = parseFile >=> \case
   (Right expr, _) -> print' expr
   (Left err, _) -> error $ show err
 
+-- | Parses a file and prints the result.
+testFileVerbose :: FilePath -> IO ()
+testFileVerbose = readFile >=> testStringWithVerbose pTopLevel
+
 -- | Parses a string and prints the result.
 testString :: String -> IO ()
 testString = testStringWith pTopLevel
 
 -- | Tests with a specific parser.
-testStringWith :: Parser Expr -> FilePath -> IO ()
-testStringWith parser s = case parseWith parser s of
-  (Right expr, _) -> print' expr
-  (Left err, _) -> error $ show err
+testStringWith :: Render a => Parser a -> String -> IO ()
+testStringWith parser s = do
+  let parser' = parser <* eof
+      s' = s ++ "\n"
+  case parseWith parser' s' of
+    (Right expr, _) -> print' expr
+    (Left err, _) -> error $ show err
 
 -- | Parses a string and prints the result.
-testStringVerbose :: FilePath -> IO ()
+testStringVerbose :: String -> IO ()
 testStringVerbose = testStringWithVerbose pTopLevel
 
--- | Parses a string and prints the result.
-testFileVerbose :: FilePath -> IO ()
-testFileVerbose = readFile >=> testStringWithVerbose pTopLevel
-
 -- | Tests with a specific parser.
-testStringWithVerbose :: Parser Expr -> FilePath -> IO ()
+testStringWithVerbose :: Render a => Parser a -> String -> IO ()
 testStringWithVerbose parser s = do
-  let (res, logs) = parseWith parser s
+  let parser' = parser <* many emptyLine <* many newline <* eof
+      s' = s ++ "\n"
+  let (res, logs) = parseWith parser' s'
   putStrLn $ unpack logs
   case res of
     Right expr -> print' expr

@@ -13,8 +13,8 @@ module Common (
   , module Data.Monoid
   , module Data.String
   , module Data.Text
-  , Pretty(..)
-  , isInt, isIntTo
+  , Render(..)
+  , isInt, isIntTo, (>>==)
   ) where
 
 import Control.Applicative hiding (many, (<|>))
@@ -39,7 +39,7 @@ isIntTo x n = do
 isInt :: Double -> Bool
 isInt x = isIntTo x 10
 
-class Show a => Pretty a where
+class Show a => Render a where
   raw :: a -> Text
   raw = pack . show
   render :: a -> Text
@@ -47,12 +47,15 @@ class Show a => Pretty a where
   pretty :: a -> Text
   pretty = render
 
-instance Pretty Double where
+instance Render Double where
   render n | isInt n = pack $ show $ floor n
            | otherwise = pack $ show n
+instance Render Char
+instance Render Text
+instance Render a => Render [a]
+instance (Render a, Render b) => Render (a, b)
+instance Render ()
 
-instance Pretty Char
+(>>==) :: Monad m => m a -> m b -> m a
+action1 >>== action2 = action1 >>= \result -> action2 >> return result
 
-instance Pretty Text
-
-instance Pretty a => Pretty [a]
