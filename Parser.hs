@@ -64,7 +64,7 @@ pExpr = choice [ logged "if"          pIf
                --, logged "return"      pReturn
                --, logged "break"       pBreak
                --, logged "continue"    pContinue
-               , logged "logical"     pBinaryOp]
+               , pBinaryOp]
 
 -- | For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
@@ -76,7 +76,13 @@ pInlineBlock = item . logged "inline block" $ Block <$> pStatement `sepBy1` scha
 
 -- | Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
-pTerm = choice [ pVariable, pNumber, pString, pParens, pArray, pObject]
+pTerm = choice [ pNumber
+               , pVariable
+               , pString
+               , pParens
+               , pArray
+               , pObject
+               ]
 
 -- | An expression wrapped in parentheses.
 pParens :: Parser Expr
@@ -168,14 +174,13 @@ pRegString = item $ String <$> (char '\'' >> go) where
       '\'' -> return str
       c -> error $ "wtf is " <> [c]
 
---pLongString :: Parser Text
---pLongString = item $ do
---  string "'''"
---  text <- anyChar `manyTill` (lookAhead)
+-- | Long strings, python-style
+pLongString :: Parser Expr
+pLongString = item $ String <$> blockStr "'''"
 
 -- | Parses either a regular string, or an interpolated one
 pString :: Parser Expr
-pString = pRegString <|> pInString -- <|> pLongString
+pString = pLongString <|> pRegString <|> pInString
 
 -- | Parses a regex.
 pRegex :: Parser Expr
@@ -281,7 +286,7 @@ pIf = item $ do
 
 -- | Used by a few structures to do inlines (if a then b; c; d)
 pThen :: Parser Expr
-pThen = pKeyword "then" *> pInlineBlock -- pBlock -- <|>
+pThen = pBlock <|> pKeyword "then" *> pInlineBlock -- pBlock -- <|>
 
 -- | Parses an 'else'. Used by @pIf@ and @pSwitch@.
 pElse :: Parser (Maybe Expr)
@@ -362,7 +367,6 @@ pCall = lexeme $ do
   case args of
     Nothing -> return func
     Just args -> return $ Expr (getPos func) $ Call func args
-
   where emptyTuple = try $ schar '(' *> char ')' *> pure []
 
 -- | This parser will grab a chain of function applications and dots.
@@ -424,7 +428,7 @@ pContinue = item $ Continue <$ pKeyword "continue"
 
 -- | Entry point for binary operators.
 pBinaryOp :: Parser Expr
-pBinaryOp = pCallChain -- logged "binary operator" pLogical
+pBinaryOp = logged "binary operator" pLogical
 
 -- | Lowest level precedence of binary operation are logical operators.
 pLogical :: Parser Expr
@@ -598,17 +602,13 @@ emptyLine = try $ do
   spaces
   finish
   where
-    finish = ignore (lookAhead (char '\n'))
+    finish = (ignore $ lookAhead $ char '\n') <|> ignore pLineComment
 
 -- | Indents, outdents, nodents which also grab up preceding emptylines.
 indent', outdent', nodent' :: Parser ()
-indent' = many emptyLine >> indent
-outdent' = many emptyLine >> outdent
-nodent' = many emptyLine >> nodent
-
--- | Skips any empty lines and then grabs a "same" (which means we're still in -- the same block)
-linesWithoutContent :: Parser ()
-linesWithoutContent = many emptyLine >> same
+indent' = try $ many emptyLine >> indent
+outdent' = try $ many emptyLine >> outdent
+nodent' = try $ many emptyLine >> nodent
 
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
@@ -620,7 +620,18 @@ blockOf p = p `sepEndBy1` same
 
 -- | Parses an indented block of @p@s.
 indented :: Render a => Parser a -> Parser [a]
-indented p = between indent' outdent' $ blockOf p
+--indented p = between (logged "indent!" indent') (logged "outdent!" outdent') $ logged "some block" $ blockOf p
+
+indented p = do
+  debug "starting an indent"
+  indent'
+  debug "got the indent"
+  block <- blockOf p
+  debug "finished getting lines"
+  outdent'
+  debug "w00t!"
+  return block
+
 
 ignore :: Parser a -> Parser ()
 ignore p = p >> return ()

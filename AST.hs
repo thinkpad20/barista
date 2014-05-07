@@ -5,6 +5,8 @@
 module AST where
 
 import Prelude hiding (replicate)
+import qualified Data.Text as T
+
 import Common
 
 data AbsExpr expr = Variable Name
@@ -65,7 +67,7 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
     Number n -> render n
     String s -> render s
     Regex r -> render r
-    InString s -> error "interp string rendering"
+    InString s -> "\"" <> render s <> "\""
     Assign pat expr -> render pat <> " = " <> render expr <> ";"
     Block exprs -> "{" <> imapr "; " exprs <> "}"
     Array exprs -> "[" <> imapr ", " exprs <> "]"
@@ -73,6 +75,8 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
     ObjectDeref e ref -> render e <> "[" <> render ref <> "]"
     Object pairs -> "{" <> intercalate ", " (map renderP pairs) <> "}"
     Function names expr -> "(" <> intercalate ", " names <> ") -> "
+                               <> render expr
+    FatArrowFunction names expr -> "(" <> intercalate ", " names <> ") => "
                                <> render expr
     Call expr exprs -> do
       let func = render' expr
@@ -141,8 +145,8 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
       Number n -> return $ render n
       String s -> return $ render s
       Regex r -> return $ render r
+      InString s -> return $ "\"" <> render s <> "\""
       EmptyExpr -> return "# empty line"
-      InString s -> error "interp string pretty printing"
       Assign pat expr -> do
         expr' <- go' expr
         return $ render pat <> " = " <> expr'
@@ -282,6 +286,11 @@ removeConsecutive c input = pack $ scanit $ input' where
   scanit [c] = [c]
   scanit (c1:c2:rest) | c1 == c && c2 == c = c2 : scanit rest
                       | otherwise = c1 : scanit (c2 : rest)
+
+instance (Render e, IsExpr e) => Render (InString e) where
+  render istr = case istr of
+    Plain s -> T.init $ T.tail $ render s
+    Interpolated s1 e s2 -> render s1 <> render e <> render s2
 
 instance IsString (InString e) where
   fromString str = Plain $ pack str
