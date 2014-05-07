@@ -1,12 +1,12 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE DeriveFunctor #-}
 module AST where
 
 import Prelude hiding (replicate)
 import Common
 
-type Name = Text
 data AbsExpr expr = Variable Name
                   | Number Double
                   | String Text
@@ -43,19 +43,21 @@ data AbsExpr expr = Variable Name
                   | Continue
                   | EmptyExpr
                   | Class (Maybe Name) (Maybe expr) [ClassDec expr]
-                  deriving (Show, Eq)
+                  deriving (Show, Eq, Functor)
 
 class IsExpr a where
   -- | Pulls the abstract expression out of a wrapped AbsExpr.
   unExpr :: a -> AbsExpr a
+  deepUnExpr :: a -> AbsExpr (AbsExpr a)
+  deepUnExpr = unExpr ~> fmap unExpr
 
 data InString e = Plain Text
                 | Interpolated (InString e) (AbsExpr e) (InString e)
-                deriving (Show, Eq)
+                deriving (Show, Eq, Functor)
 
 data ClassDec expr = ClassDecExpr expr
                    | ClassDecDef Name expr
-                   deriving (Show, Eq)
+                   deriving (Show, Eq, Functor)
 
 instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
   render = \case

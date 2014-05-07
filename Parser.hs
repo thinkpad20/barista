@@ -6,12 +6,13 @@ module Parser where
 
 import Prelude hiding (replicate)
 import Text.Parsec hiding (spaces, parse)
+import Text.Parsec.Pos (newPos)
 import System.Environment
 
 import Common hiding (tail, head)
 import AST
 
-data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show, Eq)
+data Expr = Expr SourcePos (AbsExpr Expr) deriving (Show)
 data ParserState = ParserState {indents::[Int], debugIndent::Int}
 type Parser = ParsecT String ParserState (WriterT Text Identity)
 
@@ -22,16 +23,24 @@ instance Render Expr where
 instance IsExpr Expr where
   unExpr (Expr _ abstr) = abstr
 
+instance Eq Expr where
+  Expr _ e == Expr _ e' = e == e'
+
 ------------------------------------------------------------
 -------------------  High-level parsers  -------------------
 ------------------------------------------------------------
 
 -- | Entry point parser.
 pTopLevel :: Parser Expr
-pTopLevel = go <* eof where
-  go = logged "main" (blockOf pStatement) >>= \case
-    [expr] -> return expr
-    exprs@(e:_) -> return $ Expr (getPos e) $ Block exprs
+pTopLevel = do
+  input <- getInput
+  debug "OK here we go"
+  logInput
+  go <* eof
+  where
+    go = logged "main" (blockOf pStatement) >>= \case
+      [expr] -> return expr
+      exprs@(e:_) -> return $ Expr (getPos e) $ Block exprs
 
 -- | A collection of statements separated by newlines or semicolons.
 pBlock :: Parser Expr
@@ -39,18 +48,18 @@ pBlock = item . logged "block" $ Block <$> indented pStatement
 
 -- | A statement. Possibly nothing.
 pStatement :: Parser Expr
-pStatement = logged "statement" $ pExpr <|> item' EmptyExpr
+pStatement = logged "statement" $ pExpr -- <|> item' EmptyExpr
 
 -- | An expression. If statements, unary/binary operations, etc.
 pExpr :: Parser Expr
-pExpr = choice [ -- logged "if"          pIf
+pExpr = choice [ logged "if"          pIf
                --, logged "while"       pWhile
                --, logged "for"         pFor
                --, logged "switch"      pSwitch
                --, logged "try/catch"   pTryCatch
-                 logged "function"    pFunction
+               , logged "function"    pFunction
                , logged "assignment"  pAssign
-               , logged "bare object" pBareObject
+               --, logged "bare object" pBareObject
                --, logged "newed"       pNew
                --, logged "return"      pReturn
                --, logged "break"       pBreak
@@ -63,7 +72,7 @@ pExprOrBlock = pBlock <|> pInlineBlock
 
 -- | An inline-only block
 pInlineBlock :: Parser Expr
-pInlineBlock = item $ Block <$> pStatement `sepBy1` schar ';'
+pInlineBlock = item . logged "inline block" $ Block <$> pStatement `sepBy1` schar ';'
 
 -- | Smallest unit (lower than function application or binary).
 pTerm :: Parser Expr
@@ -72,6 +81,8 @@ pTerm = choice [ pVariable, pNumber, pString, pParens, pArray, pObject]
 -- | An expression wrapped in parentheses.
 pParens :: Parser Expr
 pParens = enclose "()" pExpr
+
+section p = p <* many emptyLine <* same
 
 ------------------------------------------------------------
 -----------------------  Primitives  -----------------------
@@ -261,10 +272,20 @@ keyVal = (,) <$> pAnyIdent' <* schar ':' <*> logged "obj value" pExpr
 
 -- | If statements.
 pIf :: Parser Expr
-pIf = item $ If <$ pKeyword "if"
-                <*> logged "if condition" pExpr
-                <*> logged "then branch" pThen
-                <*> logged "else branch" pElse
+pIf = item $ do
+ pKeyword "if"
+ cond <- logged "if condition" pExpr
+ _then <- logged "then branch" pThen <* many same
+ _else <- logged "else branch" pElse
+ return $ If cond _then _else
+
+-- | Used by a few structures to do inlines (if a then b; c; d)
+pThen :: Parser Expr
+pThen = pKeyword "then" *> pInlineBlock -- pBlock -- <|>
+
+-- | Parses an 'else'. Used by @pIf@ and @pSwitch@.
+pElse :: Parser (Maybe Expr)
+pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
 
 -- | While loops.
 pWhile :: Parser Expr
@@ -295,15 +316,6 @@ pForComprehension = pExpr >>= go where
       (pKeyword "in" <|> pKeyword "of") >>= \case
         "in" -> ForInComp expr names <$> pExpr
         "of" -> ForOfComp expr names <$> pExpr
-
--- | Used by a few structures to do inlines (if a then b; c; d)
-pThen :: Parser Expr
-pThen = pBlock <|> pKeyword "then" *> pInlineBlock
-
--- | Parses an 'else'. Used by @pIf@ and @pSwitch@.
-pElse :: Parser (Maybe Expr)
-pElse = many nodent *> optionMaybe
-  (pKeyword "else" *> pExprOrBlock)
 
 -- | Parses a switch statement.
 pSwitch :: Parser Expr
@@ -412,7 +424,7 @@ pContinue = item $ Continue <$ pKeyword "continue"
 
 -- | Entry point for binary operators.
 pBinaryOp :: Parser Expr
-pBinaryOp = logged "binary operator" pLogical
+pBinaryOp = pCallChain -- logged "binary operator" pLogical
 
 -- | Lowest level precedence of binary operation are logical operators.
 pLogical :: Parser Expr
@@ -445,88 +457,6 @@ pLeftBinary ops higher = higher >>= go where
     Just op -> do
       right <- pLeftBinary ops higher
       go $ Expr (getPos left) $ Binary op left right
-
----------------------------------------------------------
------------------------  Indentation  -------------------
----------------------------------------------------------
-
--- | Succeeds if indentation has increased.
-indent :: Parser ()
-indent = logged "an indent" $ try $ do
-  newline
-  newIndent <- length <$> many (char ' ')
-  debug $ "the new indent is " <> render newIndent
-  oldIndent:_ <- indents <$> getState
-  case newIndent > oldIndent of
-    True -> pushIndent newIndent
-    False -> unexpected "Not an indent"
-  where pushIndent i = modifyState $ \s -> s{indents = i: indents s}
-
--- | Succeeds if indentation has decreased. Doesn't consume input.
-outdent :: Parser ()
-outdent = logged "an outdent" $ try $ do
-  isOutdent <- (eof >> return True) <|> lookAhead (
-    do newline
-       newIndent <- length <$> many (char ' ')
-       oldIndent:_ <- indents <$> getState
-       return (newIndent < oldIndent))
-  case isOutdent of
-    True -> popIndent
-    False -> unexpected "Not an outdent"
-  where popIndent = modifyState $ \s -> s {indents = tail $ indents s}
-
--- | Succeeds if there is a new line with the same indentation.
-nodent :: Parser ()
-nodent = try $ do
-  newline
-  newIndent <- length <$> many (char ' ')
-  oldIndent:_ <- indents <$> getState
-  case newIndent == oldIndent of
-    True -> return ()
-    False -> unexpected "Not a nodent"
-
--- | Succeeds if there's an empty line, one with only whitespace, or a comment
-emptyLine :: Parser ()
-emptyLine = try $ newline >> spaces >> finish where
-  finish = ignore (lookAhead (char '\n')) <|> ignore pLineComment
-
----- | Same as @emptyLine@, but doesn't require an initial newline. Does not
----- consume the trailing newline.
---emptyLine' :: Parser ()
---emptyLine' = try $ spaces *> logged "finishing an empty line" finish where
---  finish = ignore (lookAhead (char '\n')) <|> ignore pLineComment <|> lookAhead eof
-
--- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
-same :: Parser ()
-same = nodent <|> ignore (schar ';')
-
--- | Parses its argument one or more times, separated by @same@.
-blockOf :: Parser a -> Parser [a]
-blockOf p = p `sepBy1` (many emptyLine >> same)
-
--- | Parses an indented block of @p@s.
-indented :: Parser a -> Parser [a]
-indented p = between indent outdent $ blockOf p
-
-ignore :: Parser a -> Parser ()
-ignore p = p >> return ()
-
-perhaps :: Parser a -> Parser ()
-perhaps = ignore . optionMaybe
-
---skip = spaces *> emptyLine' `sepEndBy` newline
-
--- | Grabs any character until the stopping parser. Doesn't consume @stop@.
-strTill :: Parser a -> Parser Text
-strTill stop = fmap pack $ anyChar `manyTill` lookAhead stop
-
--- | Same as @strTill@, but consumes the stopping parser.
-strTillConsume :: Parser a -> Parser Text
-strTillConsume stop = fmap pack $ anyChar `manyTill` try stop
-
--- | For block comments and long strings.
-blockStr :: String -> Parser Text
-blockStr start = try (string start) >> strTillConsume (string start)
 
 ---------------------------------------------------------
 -----------------------  Comments  ----------------------
@@ -618,6 +548,100 @@ identChar = choice [letter, digit, char '_', char '$']
 getPos :: Expr -> SourcePos
 getPos (Expr pos _) = pos
 
+-- | Creates an expression with dummy source position, for testing.
+toExpr :: AbsExpr Expr -> Expr
+toExpr = Expr (newPos "" 0 0)
+
+---------------------------------------------------------
+-----------------------  Indentation  -------------------
+---------------------------------------------------------
+
+-- | Succeeds if indentation has increased.
+indent :: Parser ()
+indent = logged "an indent" $ try $ do
+  newline
+  newIndent <- length <$> many (char ' ')
+  debug $ "the new indent is " <> render newIndent
+  oldIndent:_ <- indents <$> getState
+  case newIndent > oldIndent of
+    True -> pushIndent newIndent
+    False -> unexpected "Not an indent"
+  where pushIndent i = modifyState $ \s -> s{indents = i: indents s}
+
+-- | Succeeds if indentation has decreased. Doesn't consume input.
+outdent :: Parser ()
+outdent = logged "an outdent" $ try $ do
+  isOutdent <- (eof >> return True) <|> lookAhead (
+    do newline
+       newIndent <- length <$> many (char ' ')
+       oldIndent:_ <- indents <$> getState
+       return (newIndent < oldIndent))
+  case isOutdent of
+    True -> popIndent
+    False -> unexpected "Not an outdent"
+  where popIndent = modifyState $ \s -> s {indents = tail $ indents s}
+
+-- | Succeeds if there is a new line with the same indentation.
+nodent :: Parser ()
+nodent = try $ do
+  newline
+  newIndent <- length <$> many (char ' ')
+  oldIndent:_ <- indents <$> getState
+  case newIndent == oldIndent of
+    True -> return ()
+    False -> unexpected "Not a nodent"
+
+-- | Succeeds if there's an empty line, one with only whitespace, or a comment
+emptyLine :: Parser ()
+emptyLine = try $ do
+  newline
+  spaces
+  finish
+  where
+    finish = ignore (lookAhead (char '\n'))
+
+-- | Indents, outdents, nodents which also grab up preceding emptylines.
+indent', outdent', nodent' :: Parser ()
+indent' = many emptyLine >> indent
+outdent' = many emptyLine >> outdent
+nodent' = many emptyLine >> nodent
+
+-- | Skips any empty lines and then grabs a "same" (which means we're still in -- the same block)
+linesWithoutContent :: Parser ()
+linesWithoutContent = many emptyLine >> same
+
+-- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
+same :: Parser ()
+same = nodent' <|> ignore (schar ';')
+
+-- | Parses its argument one or more times, separated by @same@.
+blockOf :: Render a => Parser a -> Parser [a]
+blockOf p = p `sepEndBy1` same
+
+-- | Parses an indented block of @p@s.
+indented :: Render a => Parser a -> Parser [a]
+indented p = between indent' outdent' $ blockOf p
+
+ignore :: Parser a -> Parser ()
+ignore p = p >> return ()
+
+perhaps :: Parser a -> Parser ()
+perhaps = ignore . optionMaybe
+
+--skip = spaces *> emptyLine' `sepEndBy` newline
+
+-- | Grabs any character until the stopping parser. Doesn't consume @stop@.
+strTill :: Parser a -> Parser Text
+strTill stop = fmap pack $ anyChar `manyTill` lookAhead stop
+
+-- | Same as @strTill@, but consumes the stopping parser.
+strTillConsume :: Parser a -> Parser Text
+strTillConsume stop = fmap pack $ anyChar `manyTill` try stop
+
+-- | For block comments and long strings.
+blockStr :: String -> Parser Text
+blockStr start = try (string start) >> strTillConsume (string start)
+
 ----------------------------------------------------------
 ----------------------   Debugging   ---------------------
 ----------------------------------------------------------
@@ -670,17 +694,31 @@ finally parser action = (try parser <* action) <|> (action *> unexpected "failur
 -----------------  Running the parser  -------------------
 ----------------------------------------------------------
 
+wrapParser :: Parser a -> Parser a
+wrapParser p = do
+  debug "hi..."
+  same
+  res <- p
+  logInput
+  logged "is this the end?" eof
+  return res
+  where
+    skipEmpties = logged "trying an empty" emptyLine `sepEndBy` logged "trying a newline" newline
+
 -- | Initial state of the parser
 initState :: ParserState
 initState = ParserState {indents = [0], debugIndent = 0}
 
 -- | Parses a string, retuns logs.
-parse :: String -> (Either ParseError Expr, Text)
-parse = parseWith pTopLevel
+parseString :: String -> (Either ParseError Expr, Text)
+parseString = parseWith pTopLevel
 
 -- | Parses a string, drops logs.
-parse' :: String -> Either ParseError Expr
-parse' = fst . parse
+parse :: String -> Either ParseError Expr
+parse = fst . parseString
+
+parse' :: String -> Either ParseError (AbsExpr Expr)
+parse' s = fmap unExpr $ parse s
 
 -- | Parses a string with a specific parser.
 parseWith :: Parser a -> String -> (Either ParseError a, Text)
@@ -696,13 +734,14 @@ parseFileWith parser path = readFile path >>= return . parseWith parser
 
 -- | Parses a file and prints the result.
 testFile :: FilePath -> IO ()
-testFile = parseFile >=> \case
-  (Right expr, _) -> print' expr
-  (Left err, _) -> error $ show err
+testFile = readFile >=> testString
 
 -- | Parses a file and prints the result.
 testFileVerbose :: FilePath -> IO ()
 testFileVerbose = readFile >=> testStringWithVerbose pTopLevel
+
+-- | Parses a file and prints the result.
+testFileWithVerbose p = readFile >=> testStringWithVerbose p
 
 -- | Parses a string and prints the result.
 testString :: String -> IO ()
@@ -711,8 +750,8 @@ testString = testStringWith pTopLevel
 -- | Tests with a specific parser.
 testStringWith :: Render a => Parser a -> String -> IO ()
 testStringWith parser s = do
-  let parser' = parser <* eof
-      s' = s ++ "\n"
+  let parser' = wrapParser parser
+      s' = "\n" ++ s ++ "\n"
   case parseWith parser' s' of
     (Right expr, _) -> print' expr
     (Left err, _) -> error $ show err
@@ -724,8 +763,8 @@ testStringVerbose = testStringWithVerbose pTopLevel
 -- | Tests with a specific parser.
 testStringWithVerbose :: Render a => Parser a -> String -> IO ()
 testStringWithVerbose parser s = do
-  let parser' = parser <* many emptyLine <* many newline <* eof
-      s' = s ++ "\n"
+  let parser' = wrapParser parser
+      s' = "\n" ++ s ++ "\n"
   let (res, logs) = parseWith parser' s'
   putStrLn $ unpack logs
   case res of
@@ -738,4 +777,3 @@ main = getArgs >>= \case
   opt@('-':_):_ -> error $ "Unknown option '" <> opt <> "'"
   input:_ -> testString input
   _ -> putStrLn "Please provide arguments!"
-
