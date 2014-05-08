@@ -32,11 +32,13 @@ data AbsExpr expr = Variable Name
                   | New expr
                   | Switch expr [([expr], expr)] (Maybe expr)
                   | If expr expr (Maybe expr)
-                  | Unless expr expr
+                  | EmbeddedIf expr expr
+                  | Unless expr expr (Maybe expr)
+                  | EmbeddedUnless expr expr
                   | ForIn [Name] expr expr
                   | ForOf [Name] expr expr
-                  | ForInComp expr [Name] expr
-                  | ForOfComp expr [Name] expr
+                  | EmbeddedForIn expr [Name] expr
+                  | EmbeddedForOf expr [Name] expr
                   | While expr expr
                   | TryCatch expr (Maybe (Name, expr)) (Maybe expr)
                   | Do [Name] expr
@@ -66,7 +68,7 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
     Variable n -> n
     Number n -> render n
     String s -> render s
-    Regex r -> render r
+    Regex r -> "r" <> render r
     InString s -> "\"" <> render s <> "\""
     Assign pat expr -> render pat <> " = " <> render expr <> ";"
     Block exprs -> "{" <> imapr "; " exprs <> "}"
@@ -97,9 +99,9 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
                               <> render e1 <> render e2
     ForOf pat e1 e2 -> "for " <> intercalate ", " pat <> " of "
                               <> render e1 <> render e2
-    ForInComp e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
+    EmbeddedForIn e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
                                      <> " in " <> render e2
-    ForOfComp e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
+    EmbeddedForOf e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
                                      <> " of " <> render e2
     While cond expr -> "while " <> render cond <> render expr
     TryCatch e c f -> do
@@ -117,7 +119,7 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
       case name of {Nothing -> ""; Just n -> " " <> n} <>
       case extends of {Nothing -> ""; Just e -> " extends " <> render e} <>
       case decs of {[] -> ""; ds -> "{" <> intercalate "; " (map render ds) <> "}"}
-    e -> error $ "can't render " <> show e
+    e -> pack $ show e
     where
       mapr = map render
       imapr t = intercalate t . mapr
@@ -144,7 +146,7 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
       Variable n -> return n
       Number n -> return $ render n
       String s -> return $ render s
-      Regex r -> return $ render r
+      Regex r -> return $ "r" <> render r
       InString s -> return $ "\"" <> render s <> "\""
       EmptyExpr -> return "# empty line"
       Assign pat expr -> do
@@ -207,6 +209,23 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
             f' <- go' f
             els <- line "else"
             return $ "if " <> c' <> t' <> els <> f'
+      Unless c t f -> do
+        c' <- go' c
+        t' <- go' t
+        case f of
+          Nothing -> return $ "unless " <> c' <> t'
+          Just f -> do
+            f' <- go' f
+            els <- line "else"
+            return $ "unless " <> c' <> t' <> els <> f'
+      EmbeddedIf c t -> do
+        c' <- go' c
+        t' <- go' t
+        return $ c' <> " if " <> t'
+      EmbeddedUnless c t -> do
+        c' <- go' c
+        t' <- go' t
+        return $ c' <> " unless " <> t'
       ForIn pat e1 e2 -> do
         e1' <- go' e1
         e2' <- go' e2
@@ -215,11 +234,11 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
         e1' <- go' e1
         e2' <- go' e2
         return $ "for " <> intercalate ", " pat <> " of " <> e1' <> e2'
-      ForInComp e1 names e2 -> do
+      EmbeddedForIn e1 names e2 -> do
         e1' <- go' e1
         e2' <- go' e2
         return $ e1' <> " for " <> intercalate ", " names <> " in " <> e2'
-      ForOfComp e1 names e2 -> do
+      EmbeddedForOf e1 names e2 -> do
         e1' <- go' e1
         e2' <- go' e2
         return $ e1' <> " for " <> intercalate ", " names <> " of " <> e2'
@@ -257,7 +276,8 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
             modify (\i -> i - 1)
             return $ "\n" <> mconcat strs
         return $ "class" <> name' <> extends' <> decs'
-      e -> error $ "can't pretty print " <> show e
+
+      e -> return $ pack $ show $ e
     line txt = do
       level <- get
       when (level < 0) $ error "Illegal indent level"

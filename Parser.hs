@@ -50,21 +50,39 @@ pBlock = item . logged "block" $ Block <$> indented pStatement
 pStatement :: Parser Expr
 pStatement = logged "statement" $ pExpr -- <|> item' EmptyExpr
 
--- | An expression. If statements, unary/binary operations, etc.
 pExpr :: Parser Expr
-pExpr = choice [ logged "if"          pIf
-               --, logged "while"       pWhile
-               --, logged "for"         pFor
-               --, logged "switch"      pSwitch
-               --, logged "try/catch"   pTryCatch
-               , logged "function"    pFunction
-               , logged "assignment"  pAssign
-               --, logged "bare object" pBareObject
-               --, logged "newed"       pNew
-               --, logged "return"      pReturn
-               --, logged "break"       pBreak
-               --, logged "continue"    pContinue
-               , pBinaryOp]
+pExpr = do
+  expr <- pSmallExpr
+  option expr $ lookAhead (logged "some keyword" pAnyKeyword) >>= \case
+    "for" -> pEmbeddedFor expr
+    "if" -> pEmbeddedIf expr
+    "unless" -> pEmbeddedUnless expr
+    _ -> unexpected "Unknown keyword expression"
+  --go expr = do
+  --  debug $ "got an expression " <> render expr <> ", now trying to get a for"
+  --  logInput
+  --  option expr $ item $ do
+  --    pKeyword "for"
+  --    names <- pIdent' `sepBy1` schar ','
+  --    (pKeyword "in" <|> pKeyword "of") >>= \case
+  --      "in" -> EmbeddedForIn expr names <$> pExpr
+  --      "of" -> EmbeddedForOf expr names <$> pExpr
+
+-- | An expression. If statements, unary/binary operations, etc.
+pSmallExpr :: Parser Expr
+pSmallExpr = choice [ logged "if"          pIf
+                    --, logged "while"       pWhile
+                    --, logged "for"         pFor
+                    --, logged "switch"      pSwitch
+                    --, logged "try/catch"   pTryCatch
+                    --, logged "function"    pFunction
+                    --, logged "assignment"  pAssign
+                    --, logged "bare object" pBareObject
+                    --, logged "newed"       pNew
+                    --, logged "return"      pReturn
+                    --, logged "break"       pBreak
+                    --, logged "continue"    pContinue
+                    , pBinaryOp]
 
 -- | For when either an expression or a block a block is valid.
 pExprOrBlock :: Parser Expr
@@ -79,6 +97,7 @@ pTerm :: Parser Expr
 pTerm = choice [ pNumber
                , pVariable
                , pString
+               , pRegex
                , pParens
                , pArray
                , pObject
@@ -149,7 +168,7 @@ pInString = item $ InString <$> (char '"' *> go) where
         where consume = anySpaces >> (Plain str <>) <$> go
       '#' -> anyChar >>= \case
         '{' -> do
-          expr <- unExpr <$> pExpr <* char '}'
+          expr <- unExpr <$> pSmallExpr <* char '}'
           Interpolated (Plain str) <$> (pure expr) <*> go
         c -> escape c
       '"' -> return (Plain str)
@@ -233,7 +252,8 @@ pPattern = choice $ [pCallChain, pArray, objPattern]
 -- | Parses an array literal. Currently only supports comma separation.
 pArray :: Parser Expr
 pArray = item $ do
-  exprs <- enclose "[]" $ pExpr `sepEndBy` pObjectDivider
+  exprs <- enclose "[]" $
+    anySpaces *> pSmallExpr `sepEndBy` pObjectDivider <* anySpaces
   return $ Array exprs
 
 -- | Parses an object literal.
@@ -275,14 +295,13 @@ keyVal = (,) <$> pAnyIdent' <* schar ':' <*> logged "obj value" pExpr
 -----------------  Control flow  ------------------
 ---------------------------------------------------
 
--- | If statements.
+-- | If or Unless statements.
 pIf :: Parser Expr
-pIf = item $ do
- pKeyword "if"
- cond <- logged "if condition" pExpr
- _then <- logged "then branch" pThen <* many same
- _else <- logged "else branch" pElse
- return $ If cond _then _else
+pIf = item $ k <*> cond <*> _then <*> _else where
+  k = choice [pKeyword "if" >> return If, pKeyword "unless" >> return Unless]
+  cond = logged "if condition" pExpr
+  _then = logged "then branch" pThen <* many same
+  _else = logged "else branch" pElse
 
 -- | Used by a few structures to do inlines (if a then b; c; d)
 pThen :: Parser Expr
@@ -298,6 +317,15 @@ pWhile = item $ While <$ pKeyword "while"
                       <*> logged "while condition" pExpr
                       <*> logged "while body" pThen
 
+-- | Embedded if statements. `foo = a if b`
+pEmbeddedIf :: Expr -> Parser Expr
+pEmbeddedIf expr = item $ EmbeddedIf expr <$ pKeyword "if" <*> pExpr
+
+-- | Embedded unless statements. `foo = a unless b`
+pEmbeddedUnless :: Expr -> Parser Expr
+pEmbeddedUnless expr = item $ EmbeddedUnless expr <$ pKeyword "unless" <*> pExpr
+
+
 -- | For loops, two kinds: either `in` or `of`.
 pFor :: Parser Expr
 pFor = item $ do
@@ -306,21 +334,17 @@ pFor = item $ do
   debug "trying to get identifiers"
   names <- pIdent' `sepBy1` schar ','
   (pKeyword "in" <|> pKeyword "of") >>= \case
-    "in" -> ForIn names <$> pExpr <*> pThen
-    "of" -> ForOf names <$> pExpr <*> pThen
+    "in" -> ForIn names <$> pSmallExpr <*> pThen
+    "of" -> ForOf names <$> pSmallExpr <*> pThen
 
--- | For loops, two kinds: either `in` or `of`.
-pForComprehension :: Parser Expr
-pForComprehension = pExpr >>= go where
-  go expr = do
-    debug $ "got an expression " <> render expr <> ", now trying to get a for"
-    logInput
-    option expr $ item $ do
-      pKeyword "for"
-      names <- pIdent' `sepBy1` schar ','
-      (pKeyword "in" <|> pKeyword "of") >>= \case
-        "in" -> ForInComp expr names <$> pExpr
-        "of" -> ForOfComp expr names <$> pExpr
+-- | For comprehensions (a for b in c).
+pEmbeddedFor :: Expr -> Parser Expr
+pEmbeddedFor expr = item $ logged "for comp" $ do
+  pKeyword "for"
+  names <- pIdent' `sepBy1` schar ','
+  (pKeyword "in" <|> pKeyword "of") >>= \case
+    "in" -> EmbeddedForIn expr names <$> pExpr
+    "of" -> EmbeddedForOf expr names <$> pExpr
 
 -- | Parses a switch statement.
 pSwitch :: Parser Expr
@@ -330,7 +354,7 @@ pSwitch = item $ do
   (cases, _else) <- getCases
   return $ Switch cond cases _else
   where sCase :: Parser ([Expr], Expr)
-        sCase = (,) <$ pKeyword "when" <*> pExpr `sepBy1` schar ',' <*> pThen
+        sCase = (,) <$ pKeyword "when" <*> pSmallExpr `sepBy1` schar ',' <*> pThen
         getCases = do
           indent
           cases <- blockOf sCase
@@ -363,7 +387,7 @@ pCall = lexeme $ do
   func <- pCallChain
   debug $ "parsed 'func' " <> render func
   args <- logged "function args" $ optionMaybe $ try $ do
-    emptyTuple <|> pExpr `sepBy1` schar ','
+    emptyTuple <|> pSmallExpr `sepBy1` schar ','
   case args of
     Nothing -> return func
     Just args -> return $ Expr (getPos func) $ Call func args
@@ -383,12 +407,12 @@ pCallChain = lexeme $ pTerm >>= go where
       -- it's a function call.
       '(' -> do
         -- Grab the arguments, then recurse.
-        args <- schar '(' *> pExpr `sepBy` schar ',' <* char ')'
+        args <- schar '(' *> pSmallExpr `sepBy` schar ',' <* char ')'
         go $ Expr (getPos expr) $ Call expr args
       -- If there is a square bracket, it's an object dereference.
       '[' -> do
         -- Grab the arguments, then recurse.
-        ref <- schar '[' *> pExpr <* char ']'
+        ref <- schar '[' *> pSmallExpr <* char ']'
         go $ Expr (getPos expr) $ ObjectDeref expr ref
       -- Otherwise, we can skip spaces.
       c -> spaces *> lookAhead anyChar >>= \case
@@ -524,8 +548,11 @@ enclose (c1:c2:[]) = between (schar c1) (schar c2)
 enclose _ = error "Argument to `enclose` should be a string of length 2"
 
 -- | Parses a given keyword. If it fails, it consumes no input.
-pKeyword :: String -> Parser Text
-pKeyword s = ltry $ pack <$> string s <* notFollowedBy identChar
+pKeyword :: Text -> Parser Text
+pKeyword (unpack -> s) = ltry $ pack <$> string s <* notFollowedBy identChar
+
+pAnyKeyword :: Parser Text
+pAnyKeyword = choice $ map pKeyword $ toList keywords
 
 -- | Parses the exact symbol given, or consumes nothing.
 pExactSym :: String -> Parser Text
@@ -597,18 +624,15 @@ nodent = try $ do
 
 -- | Succeeds if there's an empty line, one with only whitespace, or a comment
 emptyLine :: Parser ()
-emptyLine = try $ do
-  newline
-  spaces
-  finish
+emptyLine = try $ newline *> spaces *> finish
   where
     finish = (ignore $ lookAhead $ char '\n') <|> ignore pLineComment
 
 -- | Indents, outdents, nodents which also grab up preceding emptylines.
 indent', outdent', nodent' :: Parser ()
-indent' = try $ many emptyLine >> indent
+indent'  = try $ many emptyLine >> indent
 outdent' = try $ many emptyLine >> outdent
-nodent' = try $ many emptyLine >> nodent
+nodent'  = try $ many emptyLine >> nodent
 
 -- | In CoffeeScript, a semicolon is (mostly) the same as same indentation.
 same :: Parser ()
