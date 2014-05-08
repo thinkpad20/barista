@@ -59,15 +59,6 @@ pExpr = do
     "while" -> pEmbeddedWhile expr
     "for" -> pEmbeddedFor expr
     _ -> unexpected "Unknown keyword expression"
-  --go expr = do
-  --  debug $ "got an expression " <> render expr <> ", now trying to get a for"
-  --  logInput
-  --  option expr $ item $ do
-  --    pKeyword "for"
-  --    names <- pIdent' `sepBy1` schar ','
-  --    (pKeyword "in" <|> pKeyword "of") >>= \case
-  --      "in" -> EmbeddedForIn expr names <$> pExpr
-  --      "of" -> EmbeddedForOf expr names <$> pExpr
 
 -- | An expression. If statements, unary/binary operations, etc.
 pSmallExpr :: Parser Expr
@@ -101,8 +92,7 @@ pTerm = choice [ pNumber
                , pRegex
                , pParens
                , pArray
-               , pObject
-               ]
+               , pObject ]
 
 -- | An expression wrapped in parentheses.
 pParens :: Parser Expr
@@ -484,8 +474,7 @@ pExponent = pLeftBinary ["**"] pCall
 -- next-higher-precedence parser to run first.
 pLeftBinary :: [String] -> Parser Expr -> Parser Expr
 pLeftBinary ops higher = higher >>= go where
-  ops' :: Parser Text
-  ops' = try $ choice (map pExactSym ops) <* spaces
+  ops' = try $ choice (map pExactSym ops) <* anySpaces
   go left = spaces *> optionMaybe ops' >>= \case
     Nothing -> return left
     Just op -> do
