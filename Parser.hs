@@ -54,9 +54,10 @@ pExpr :: Parser Expr
 pExpr = do
   expr <- pSmallExpr
   option expr $ lookAhead (logged "some keyword" pAnyKeyword) >>= \case
-    "for" -> pEmbeddedFor expr
     "if" -> pEmbeddedIf expr
     "unless" -> pEmbeddedUnless expr
+    "while" -> pEmbeddedWhile expr
+    "for" -> pEmbeddedFor expr
     _ -> unexpected "Unknown keyword expression"
   --go expr = do
   --  debug $ "got an expression " <> render expr <> ", now trying to get a for"
@@ -71,17 +72,17 @@ pExpr = do
 -- | An expression. If statements, unary/binary operations, etc.
 pSmallExpr :: Parser Expr
 pSmallExpr = choice [ logged "if"          pIf
-                    --, logged "while"       pWhile
-                    --, logged "for"         pFor
-                    --, logged "switch"      pSwitch
-                    --, logged "try/catch"   pTryCatch
-                    --, logged "function"    pFunction
-                    --, logged "assignment"  pAssign
-                    --, logged "bare object" pBareObject
-                    --, logged "newed"       pNew
-                    --, logged "return"      pReturn
-                    --, logged "break"       pBreak
-                    --, logged "continue"    pContinue
+                    , logged "while"       pWhile
+                    , logged "for"         pFor
+                    , logged "switch"      pSwitch
+                    , logged "try/catch"   pTryCatch
+                    , logged "function"    pFunction
+                    , logged "assignment"  pAssign
+                    , logged "bare object" pBareObject
+                    , logged "newed"       pNew
+                    , logged "return"      pReturn
+                    , logged "break"       pBreak
+                    , logged "continue"    pContinue
                     , pBinaryOp]
 
 -- | For when either an expression or a block a block is valid.
@@ -311,12 +312,6 @@ pThen = pBlock <|> pKeyword "then" *> pInlineBlock -- pBlock -- <|>
 pElse :: Parser (Maybe Expr)
 pElse = optionMaybe $ pKeyword "else" *> pExprOrBlock
 
--- | While loops.
-pWhile :: Parser Expr
-pWhile = item $ While <$ pKeyword "while"
-                      <*> logged "while condition" pExpr
-                      <*> logged "while body" pThen
-
 -- | Embedded if statements. `foo = a if b`
 pEmbeddedIf :: Expr -> Parser Expr
 pEmbeddedIf expr = item $ EmbeddedIf expr <$ pKeyword "if" <*> pExpr
@@ -339,12 +334,21 @@ pFor = item $ do
 
 -- | For comprehensions (a for b in c).
 pEmbeddedFor :: Expr -> Parser Expr
-pEmbeddedFor expr = item $ logged "for comp" $ do
+pEmbeddedFor expr = item $ logged "embedded for" $ do
   pKeyword "for"
   names <- pIdent' `sepBy1` schar ','
   (pKeyword "in" <|> pKeyword "of") >>= \case
     "in" -> EmbeddedForIn expr names <$> pExpr
     "of" -> EmbeddedForOf expr names <$> pExpr
+
+-- | While loops.
+pWhile :: Parser Expr
+pWhile = item $ While <$ pKeyword "while"
+                      <*> logged "while condition" pExpr
+                      <*> logged "while body" pThen
+
+pEmbeddedWhile :: Expr -> Parser Expr
+pEmbeddedWhile expr = item $ EmbeddedWhile expr <$ pKeyword "while" <*> pExpr
 
 -- | Parses a switch statement.
 pSwitch :: Parser Expr
@@ -412,16 +416,18 @@ pCallChain = lexeme $ pTerm >>= go where
       -- If there is a square bracket, it's an object dereference.
       '[' -> do
         -- Grab the arguments, then recurse.
-        ref <- schar '[' *> pSmallExpr <* char ']'
-        go $ Expr (getPos expr) $ ObjectDeref expr ref
+        ref <- schar '[' *> pExpr
+        ref2 <- optionMaybe $ try $ sstring ".." *> pExpr
+        char ']'
+        case ref2 of
+          Nothing -> go $ Expr (getPos expr) $ ObjectDeref expr ref
+          Just e -> go $ Expr (getPos expr) $ ArraySlice expr ref e
       -- Otherwise, we can skip spaces.
-      c -> spaces *> lookAhead anyChar >>= \case
-        -- If the next thing is a dot, then grab an identifier and recurse.
-        '.' -> do
-          member <- char '.' *> pAnyIdent
+      c -> spaces *> do
+        option expr $ try $ do
+          char '.' >> notFollowedBy (char '.')
+          member <- pAnyIdent'
           go $ Expr (getPos expr) $ Dotted expr member
-        -- Otherwise, we're done.
-        c -> return expr
     -- It's possible that the lookAhead will fail, if we have no input left.
     -- Put this in just in case.
     <|> return expr

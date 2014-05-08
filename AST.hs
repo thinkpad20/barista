@@ -18,6 +18,7 @@ data AbsExpr expr = Variable Name
                   | Block [expr]
                   | Array [expr]
                   | ArrayRange expr expr
+                  | ArraySlice expr expr expr
                   | Object [(Name, expr)]
                   | ObjectDeref expr expr
                   | Function [Name] expr
@@ -32,14 +33,15 @@ data AbsExpr expr = Variable Name
                   | New expr
                   | Switch expr [([expr], expr)] (Maybe expr)
                   | If expr expr (Maybe expr)
-                  | EmbeddedIf expr expr
                   | Unless expr expr (Maybe expr)
-                  | EmbeddedUnless expr expr
                   | ForIn [Name] expr expr
                   | ForOf [Name] expr expr
+                  | While expr expr
+                  | EmbeddedIf expr expr
+                  | EmbeddedUnless expr expr
                   | EmbeddedForIn expr [Name] expr
                   | EmbeddedForOf expr [Name] expr
-                  | While expr expr
+                  | EmbeddedWhile expr expr
                   | TryCatch expr (Maybe (Name, expr)) (Maybe expr)
                   | Do [Name] expr
                   | Comment Text
@@ -74,6 +76,8 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
     Block exprs -> "{" <> imapr "; " exprs <> "}"
     Array exprs -> "[" <> imapr ", " exprs <> "]"
     ArrayRange e1 e2 -> "[" <> render e1 <> " .. " <> render e2 <> "]"
+    ArraySlice e start stop ->
+      render e <> "[" <> render start <> " .. " <> render stop <> "]"
     ObjectDeref e ref -> render e <> "[" <> render ref <> "]"
     Object pairs -> "{" <> intercalate ", " (map renderP pairs) <> "}"
     Function names expr -> "(" <> intercalate ", " names <> ") -> "
@@ -104,6 +108,7 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
     EmbeddedForOf e1 pat e2 -> render e1 <> " for " <> intercalate ", " pat
                                      <> " of " <> render e2
     While cond expr -> "while " <> render cond <> render expr
+    EmbeddedWhile cond expr -> render cond <> " while " <> render expr
     TryCatch e c f -> do
       let catch = case c of Nothing -> ""
                             Just c -> "catch " <> render c
@@ -160,6 +165,11 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
         res1 <- go' e1
         res2 <- go' e2
         return $ "[" <> res1 <> " .. " <> res2 <> "]"
+      ArraySlice e start stop -> do
+        e' <- go' e
+        start' <- go' start
+        stop' <- go' stop
+        return $ e' <> "[" <> start' <> " .. " <> stop' <> "]"
       ObjectDeref e ref -> do
         e' <- go' e
         ref' <- go' ref
@@ -246,6 +256,10 @@ instance (IsExpr expr, Render expr) => Render (AbsExpr expr) where
         cond' <- go' cond
         expr' <- go' expr
         return $ "while " <> cond' <> expr'
+      EmbeddedWhile cond expr -> do
+        cond' <- go' cond
+        expr' <- go' expr
+        return $ cond' <> " while " <> expr'
       TryCatch e c f -> do
         e' <- go' e
         catch <- case c of Nothing -> return ""
