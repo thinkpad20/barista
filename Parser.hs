@@ -456,7 +456,8 @@ pLogical = pLeftBinary ["&&", "||", "and", "or"] pComparative
 
 -- | Comparisons are next higher precedence
 pComparative :: Parser Expr
-pComparative = pLeftBinary ["<", ">", "<=", ">=", "==", "!=", "is", "isnt"] pAdditive
+pComparative = pLeftBinary [ "<", ">", "<=", ">=", "=="
+                           , "!=", "is", "isnt", "in"] pAdditive
 
 -- | Addition, subtraction
 pAdditive :: Parser Expr
@@ -727,7 +728,11 @@ finally parser action = (try parser <* action) <|> (action *> unexpected "failur
 wrapParser :: Parser a -> Parser a
 wrapParser p = do
   debug "hi..."
-  same
+  lookAhead anyChar >>= \case
+    '\n' -> same
+    ' ' -> same
+    '#' -> same
+    _ -> return ()
   res <- p
   logInput
   logged "is this the end?" eof
@@ -781,7 +786,7 @@ testString = testStringWith pTopLevel
 testStringWith :: Render a => Parser a -> String -> IO ()
 testStringWith parser s = do
   let parser' = wrapParser parser
-      s' = "\n" ++ s ++ "\n"
+      s' = s ++ "\n"
   case parseWith parser' s' of
     (Right expr, _) -> print' expr
     (Left err, _) -> error $ show err
