@@ -5,6 +5,7 @@
 module Common (
     module Control.Applicative
   , module Control.Monad
+  , module Control.Monad.Error
   , module Control.Monad.Trans
   , module Control.Monad.Identity
   , module Control.Monad.State.Strict
@@ -25,8 +26,9 @@ import Prelude (IO, Eq(..), Ord(..), Bool(..), flip, (*), (/), (^), any, zip,
                 tail, (+), (-), elem, Either(..), length, fromIntegral,
                 otherwise)
 import qualified Prelude as P
-import Control.Applicative hiding (many, (<|>))
+import Control.Applicative
 import Control.Monad
+import "mtl" Control.Monad.Error
 import "mtl" Control.Monad.Trans (liftIO)
 import "mtl" Control.Monad.State.Strict
 import "mtl" Control.Monad.Identity
@@ -66,8 +68,8 @@ instance Render a => Render [a]
 instance (Render a, Render b) => Render (a, b)
 instance Render ()
 
-(>>==) :: Monad m => m a -> m b -> m a
-action1 >>== action2 = action1 >>= \result -> action2 >> return result
+(>>==) :: Monad m => m a -> (a -> m b) -> m a
+action1 >>== action2 = action1 >>= \r -> action2 r >> return r
 
 (|>) = flip ($)
 infixl 0 |>

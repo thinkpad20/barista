@@ -5,7 +5,7 @@
 module Parser where
 
 import Prelude hiding (replicate)
-import Text.Parsec hiding (spaces, parse)
+import Text.Parsec hiding (spaces, parse, many, (<|>))
 import Text.Parsec.Pos (newPos)
 import System.Environment
 
