@@ -13,11 +13,6 @@ import Data.Char (toLower)
 import System.Environment
 import System.IO.Unsafe
 
-data PToken = PToken
-  { tPosition :: SourcePos
-  , tHasSpace :: Bool
-  , tToken         :: Token } deriving (Show, Eq)
-
 data TokenizerState = TokenizerState
   { tsIndentLevels :: [Int]
   , tsHasSpace     :: Bool } deriving (Show, Eq)
@@ -35,6 +30,10 @@ spaces = many (char ' ') >>== \case
   [] -> return ()
   _ -> modifyState $ \s -> s {tsHasSpace=True}
 
+anySpaces :: Tokenizer String
+anySpaces = many (oneOf "\r\n\t ") >>== \case
+  [] -> return ()
+  _ -> modifyState $ \s -> s {tsHasSpace=True}
 
 sstring :: String -> Tokenizer String
 sstring s = lexeme $ string s
@@ -56,6 +55,13 @@ item tokenizer = do
   , tPosition = pos
   }
 
+litem :: Tokenizer Token -> Tokenizer PToken
+litem = lexeme . item
+
+-- | Grabs any character until the stopping parser. Doesn't consume @stop@.
+strTill :: Tokenizer a -> Tokenizer Text
+strTill stop = fmap pack $ anyChar `manyTill` lookAhead stop
+
 ------------------------------------------------------------
 -----------------------  Primitives  -----------------------
 ------------------------------------------------------------
@@ -70,7 +76,7 @@ identifier = do
   return $ pack (first : rest)
 
 tAnyId :: Tokenizer PToken
-tAnyId = lexeme $ item $ TId <$> identifier
+tAnyId = litem $ TId <$> identifier
 
 tId :: Tokenizer PToken
 tId = lexeme $ try $ item $ do
@@ -79,7 +85,7 @@ tId = lexeme $ try $ item $ do
   else return $ TId id
 
 tNum :: Tokenizer PToken
-tNum = lexeme $ item $ do
+tNum = litem $ do
   first <- many1 digit
   option (TInt $ read first) $ do
     dot <- try (char '.' <* notFollowedBy (char '.'))
@@ -87,7 +93,7 @@ tNum = lexeme $ item $ do
     return $ TFloat $ read $ first <> (dot : rest)
 
 tKeyword :: Tokenizer PToken
-tKeyword = try $ lexeme $ item $ choice $ map go keywords
+tKeyword = try $ litem $ choice $ map go keywords
   where
     go (kw, unpack -> name) = try $ do
       string name
@@ -98,13 +104,57 @@ tKeyword = try $ lexeme $ item $ choice $ map go keywords
 -------------------  Strings & regexes  --------------------
 ------------------------------------------------------------
 
-tString :: Tokenizer PToken
-tString = lexeme $ item $ do
-  start <- oneOf "'\""
-  TStr . pack <$> (many $ noneOf [start]) <* char start
+tRegString :: Tokenizer PToken
+tRegString = litem $ char '\'' >> TStr <$> go where
+  go = do
+    str <- strTill (oneOf "\\'")
+    let escape c = ((str `snoc` c) <>) <$> go
+    oneOf "\\'" >>= \case
+      '\\' -> anyChar >>= \case
+        'n'  -> escape '\n'
+        '\\' -> escape '\\'
+        't'  -> escape '\t'
+        'r'  -> escape '\r'
+        'b'  -> escape '\b'
+        c | c `elem` [' ', '\n', '\t'] -> consume
+          | otherwise -> escape c
+        where consume = anySpaces >> (str <>) <$> go
+      '\'' -> return str
+      c -> error $ "wtf is " <> [c]
+
+-- | An interpolated string.
+tInString :: Tokenizer PToken
+tInString = item $ char '"' >> TIStr <$> go where
+  go = do
+    str <- Plain . pack <$> many (noneOf "\"#\\")
+    anyChar >>= \case
+      '\\' -> do
+        c <- anyChar
+        fmap ((str <> Plain ("\\" <> singleton c)) <>) $ go
+      '#' -> anyChar >>= \case
+        '{' -> do
+           str' <- balancedString '}'
+           case tokenize str' of
+            Left err -> unexpected $ show err
+            Right tokens -> IStr str tokens <$> go
+      '"' -> return str
+
+balancedString :: Char -> Tokenizer String
+balancedString stop = reverse <$> loop ([stop], "")
+  where
+    loop :: ([Char], String) -> Tokenizer String
+    loop (stop:rest, str) = anyChar >>= \case
+      c | c == stop -> case rest of [] -> return str
+                                    _  -> loop (rest, c:str)
+      '\\' -> anyChar >>= \c -> loop (stop:rest, c:'\\':str)
+      '#' | stop == '"' -> anyChar >>= \case
+        '{' -> loop ('}':stop:rest, '{':'#':str)
+        c   -> loop (stop:rest, c:'#':str)
+      c | stop == '}' && c `elem` ['"', '\''] -> loop (c:stop:rest, c:str)
+      c -> loop (stop:rest, c:str)
 
 tRegex :: Tokenizer PToken
-tRegex = lexeme $ item $ do
+tRegex = litem $ do
   char '/'
   lookAhead anyChar >>= \case
     ' ' -> return $ TSymbol "/"
@@ -213,13 +263,15 @@ tOneToken :: Tokenizer PToken
 tOneToken = choice
   [ tBlockComment
   , tLineComment
-  , tString
+  , tRegString
+  , tInString
   , tKeyword
   , tId
   , tNum
   , tRegex
   , tSymbol
   , tDent
+  , try $ tPunc "..."
   , try $ tPunc ".."
   , tCharPuncs "(){}[]:,;."
   ]
@@ -254,6 +306,8 @@ testString :: String -> IO ()
 testString s = case tokenize s of
   Right tokens -> mapM_ print tokens
   Left err -> error $ show err
+
+
 
 --main :: IO ()
 --main = getArgs >>= \case
