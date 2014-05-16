@@ -11,7 +11,7 @@ data Token = TId Name
            | TStr Text
            | TIStr IStr
            | TSymbol Name
-           | TPunc Text
+           | TPunc Char
            | Indent
            | Outdent
            | Nodent
